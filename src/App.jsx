@@ -106,7 +106,7 @@ function KPI({label,value,sub,color=C.text,icon,delta}){
   );
 }
 function TH({cols}){
-  return <thead><tr style={{background:"#f8fafc"}}>{cols.map(c=><th key={c} style={{textAlign:"left",color:C.muted,fontSize:11,fontWeight:700,padding:"10px 14px",borderBottom:`1px solid ${C.border}`,whiteSpace:"nowrap",letterSpacing:"0.05em"}}>{c}</th>)}</tr></thead>;
+  return <thead><tr style={{background:"#f8fafc"}}>{cols.map(c=><th key={c} style={{textAlign:"left",color:C.muted,fontSize:11,fontWeight:700,padding:"10px 14px",borderBottom:`1px solid ${C.border}`,whiteSpace:"nowrap",letterSpacing:"0.05em",verticalAlign:"middle"}}>{c}</th>)}</tr></thead>;
 }
 function InN({value,onChange,prefix="",suffix="",width="80px"}){
   return <span style={{display:"inline-flex",alignItems:"center",gap:3}}>
@@ -164,7 +164,7 @@ function Spark({data,color=C.blue,threshold}){
 function PinLogin({accessUsers,onLogin}){
   const [pin,setPin]=useState(""); const [err,setErr]=useState("");
   const go=()=>{
-    if(pin==="SHU0311"){onLogin("__admin__");return;}
+    if(pin==="ADMIN"){onLogin("__admin__");return;}
     const u=accessUsers.find(u=>u.pin===pin&&u.pin);
     if(u){onLogin(u.id);setErr("");}else{setErr("Incorrect PIN. Contact your administrator.");setPin("");}
   };
@@ -302,16 +302,16 @@ function PersonTab({items,setItems,type,financials}){
             "Weekly Hours":x.weeklyHours,"Hourly Rate ($)":x.hourlyRate,
             "Weekly Pay ($)":x.weeklyHours*x.hourlyRate,"Total Paid ($)":x.totalPaidToDate||0,
             "Activity %":x.activityPct,"Completion %":x.completionRate,
-          }))}]};
+          }))}],"NES_Export");
         }} label={`⬇ Export ${isE?"Experts":isR?"Reviewers":"Ops Team"}`}/>
         <button onClick={openAdd} style={{...btnSm,background:color,color:"#fff",border:"none"}}>+ Add {isE?"Expert":isR?"Reviewer":"Ops Member"}</button>
       </div>
 
       <div style={{background:C.surface,border:`1px solid ${C.border}`,borderRadius:12,overflowX:"auto"}}>
         <table style={{width:"100%",borderCollapse:"collapse",minWidth:860}}>
-          <TH cols={isE?["ID","Name","Status","Region","Assignment","This Week","Total","Quality","AHT","Trend","$/task","Actions"]
-            :isR?["ID","Name","Status","Region","Assignment","This Week","Total","Quality","AHT","Trend","Actions"]
-            :["ID","Name","Role","Region","Hrs/Wk","Rate ($/h)","Weekly Pay","Total Paid","Activity","Status","Actions"]}/>
+          <TH cols={isE?["#","Name","Status","Region","Assignment","This Week","Total","Quality","AHT","Trend","$/task","Actions"]
+            :isR?["#","Name","Status","Region","Assignment","This Week","Total","Quality","AHT","Trend","Actions"]
+            :["#","Name","Role","Region","Hrs/Wk","Rate ($/h)","Weekly Pay","Total Paid","Activity","Status","Actions"]}/>
           <tbody>
             {filtered.length===0&&<tr><td colSpan={12} style={{padding:40,textAlign:"center",color:C.faint}}>No {type}s yet. Click "+ Add" to get started.</td></tr>}
             {filtered.map((x,i)=>{
@@ -321,7 +321,7 @@ function PersonTab({items,setItems,type,financials}){
               const weeklyPay=(!isE&&!isR)?(x.weeklyHours||0)*(x.hourlyRate||0):null;
               return(
                 <tr key={x.id} style={{borderTop:`1px solid ${C.border}`,background:i%2?"#fafafa":C.surface}}>
-                  <td style={{padding:"10px 14px",color:C.muted,fontFamily:"'DM Mono',monospace",fontSize:12}}>{x.id}</td>
+                  <td style={{padding:"10px 14px",color:C.faint,fontFamily:"'DM Mono',monospace",fontSize:12,width:40}}>{i+1}</td>
                   <td style={{padding:"10px 14px",fontWeight:700}}>{x.name}</td>
                   {(!isE&&!isR)&&<td style={{padding:"10px 14px",color:C.blue,fontSize:13}}>{x.role}</td>}
                   {(isE||isR)&&<td style={{padding:"10px 14px"}}><Bdg color={STATUS_COLOR_MAP[x.status]||C.faint}>{x.status}</Bdg></td>}
@@ -370,7 +370,6 @@ function PersonTab({items,setItems,type,financials}){
         <Modal title={`${editId?"Edit":"Add"} ${isE?"Expert":isR?"Reviewer":"Ops Member"}`} onClose={()=>setModal(false)}>
           <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:14}}>
             <FF label="Name"><input type="text" value={form.name} onChange={e=>upd("name",e.target.value)} style={iStyle}/></FF>
-            <FF label="ID"><input type="text" value={form.id} onChange={e=>upd("id",e.target.value)} style={iStyle}/></FF>
             <FF label="Status">
               <select value={form.status} onChange={e=>upd("status",e.target.value)} style={selStyle}>
                 {PERSON_STATUSES.map(s=><option key={s} value={s}>{s}</option>)}
@@ -794,14 +793,14 @@ function QualityTab({experts,reviewers,financials}){
       <Card title="Quality Leaderboard">
         <div style={{overflowX:"auto"}}>
           <table style={{width:"100%",borderCollapse:"collapse"}}>
-            <TH cols={["Rank","Name","Type","Region","Quality %","AHT","Flag","Trend","History"]}/>
+            <TH cols={["#","Name","Type","Region","Quality %","AHT","Flag","Trend","History"]}/>
             <tbody>
               {withQ.sort((a,b)=>b.qualityScore-a.qualityScore).map((x,i)=>{
                 const hist=(x.qualityHistory||[]).map(h=>h.score);
                 const ahtFlag=avgAHT>0&&x.avgSpeed>0?(x.avgSpeed>avgAHT*1.3?"slow":x.avgSpeed<avgAHT*0.6?"fast":null):null;
                 return(
                   <tr key={x.id} style={{borderTop:`1px solid ${C.border}`,background:i%2?"#fafafa":C.surface}}>
-                    <td style={{padding:"10px 14px",fontFamily:"'DM Mono',monospace",color:i<3?C.yellow:C.muted}}>#{i+1}</td>
+                    <td style={{padding:"10px 14px",fontFamily:"'DM Mono',monospace",color:i<3?C.yellow:C.faint,width:40}}>{i+1}</td>
                     <td style={{padding:"10px 14px",fontWeight:700}}>{x.name}</td>
                     <td style={{padding:"10px 14px"}}><Bdg color={x.type==="Expert"?C.blue:C.purple}>{x.type}</Bdg></td>
                     <td style={{padding:"10px 14px",color:C.muted,fontSize:13}}>{x.region}</td>
@@ -1153,13 +1152,14 @@ function FinancialsTab({experts,reviewers,opsTeam,financials,setFinancials,phase
       {/* Ops Pay Summary */}
       <Card title="Ops Team Pay Summary">
         <table style={{width:"100%",borderCollapse:"collapse"}}>
-          <TH cols={["Name","Role","Hrs/Wk","Hourly Rate","Weekly Pay","Total Paid to Date"]}/>
+          <TH cols={["#","Name","Role","Hrs/Wk","Hourly Rate","Weekly Pay","Total Paid to Date"]}/>
           <tbody>
-            {opsTeam.length===0&&<tr><td colSpan={6} style={{padding:30,textAlign:"center",color:C.faint}}>Add ops members to see pay summary.</td></tr>}
+            {opsTeam.length===0&&<tr><td colSpan={7} style={{padding:30,textAlign:"center",color:C.faint}}>Add ops members to see pay summary.</td></tr>}
             {opsTeam.map((o,i)=>{
               const weeklyPay=(o.weeklyHours||0)*(o.hourlyRate||0);
               return(
                 <tr key={o.id} style={{borderTop:`1px solid ${C.border}`,background:i%2?"#fafafa":C.surface}}>
+                  <td style={{padding:"10px 14px",color:C.faint,fontFamily:"'DM Mono',monospace",fontSize:12,width:40}}>{i+1}</td>
                   <td style={{padding:"10px 14px",fontWeight:700}}>{o.name}</td>
                   <td style={{padding:"10px 14px",color:C.muted,fontSize:13}}>{o.role}</td>
                   <td style={{padding:"10px 14px",fontFamily:"'DM Mono',monospace"}}>{o.weeklyHours||0}h</td>
@@ -1170,7 +1170,7 @@ function FinancialsTab({experts,reviewers,opsTeam,financials,setFinancials,phase
               );
             })}
             {opsTeam.length>0&&<tr style={{borderTop:`2px solid ${C.border}`,background:"#f8fafc"}}>
-              <td colSpan={4} style={{padding:"10px 14px",fontWeight:800,textAlign:"right"}}>Total Weekly:</td>
+              <td colSpan={5} style={{padding:"10px 14px",fontWeight:800,textAlign:"right"}}>Total Weekly:</td>
               <td style={{padding:"10px 14px",fontFamily:"'DM Mono',monospace",fontWeight:800,color:C.blue}}>{fmtU(opsTeam.reduce((s,o)=>s+(o.weeklyHours||0)*(o.hourlyRate||0),0))}</td>
               <td style={{padding:"10px 14px",fontFamily:"'DM Mono',monospace",fontWeight:800,color:C.orange}}>{fmtU(opsTeam.reduce((s,o)=>s+(o.totalPaidToDate||0),0))}</td>
             </tr>}
@@ -1467,13 +1467,14 @@ function AccessTab({accessUsers,setAccessUsers}){
       </div>
       <div style={{background:C.surface,border:`1px solid ${C.border}`,borderRadius:12,overflow:"hidden"}}>
         <table style={{width:"100%",borderCollapse:"collapse"}}>
-          <TH cols={["Name","Email","Role","PIN","Tab Access","Added","Actions"]}/>
+          <TH cols={["#","Name","Email","Role","PIN","Tab Access","Added","Actions"]}/>
           <tbody>
-            {accessUsers.length===0&&<tr><td colSpan={7} style={{padding:40,textAlign:"center",color:C.faint}}>No users added yet.</td></tr>}
+            {accessUsers.length===0&&<tr><td colSpan={8} style={{padding:40,textAlign:"center",color:C.faint}}>No users added yet.</td></tr>}
             {accessUsers.map((u,i)=>{
               const enabled=Object.entries(u.tabs||{}).filter(([,v])=>v).map(([k])=>k);
               return(
                 <tr key={u.id} style={{borderTop:`1px solid ${C.border}`,background:i%2?"#fafafa":C.surface}}>
+                  <td style={{padding:"12px 14px",color:C.faint,fontFamily:"'DM Mono',monospace",fontSize:12,width:40}}>{i+1}</td>
                   <td style={{padding:"12px 14px",fontWeight:700}}>{u.name}</td>
                   <td style={{padding:"12px 14px",color:C.muted,fontSize:13}}>{u.email||"—"}</td>
                   <td style={{padding:"12px 14px"}}><Bdg color={u.role==="admin"?C.red:C.blue}>{u.role}</Bdg></td>
