@@ -5,6 +5,48 @@ import {
 } from "recharts";
 import * as XLSX from "xlsx";
 import PptxGenJS from "pptxgenjs";
+import { createClient } from "@supabase/supabase-js";
+
+// ─── SUPABASE ─────────────────────────────────────────────────────────────────
+const SUPA_URL = "https://qhhcdoovufokxbkaytgc.supabase.co";
+const SUPA_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InFoaGNkb292dWZva3hia2F5dGdjIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzUyNjU4NTcsImV4cCI6MjA5MDg0MTg1N30.czV5KxG6LiRfJBdFiWSxmTGDPnlW8brMmD4Wu4wI-HE";
+const sb = createClient(SUPA_URL, SUPA_KEY);
+
+// Each "collection" is stored as a single row in its table with id='singleton'
+// For arrays (experts, reviewers etc) we store the whole array as a jsonb value
+// This keeps the schema dead-simple and avoids per-row complexity
+async function sbGet(table, fallback) {
+  try {
+    const { data, error } = await sb.from(table).select("data").eq("id","singleton").single();
+    if (error || !data) return fallback;
+    return data.data ?? fallback;
+  } catch { return fallback; }
+}
+async function sbSet(table, value) {
+  try {
+    await sb.from(table).upsert({ id:"singleton", data: value }, { onConflict:"id" });
+  } catch(e) { console.error("Supabase write error:", table, e); }
+}
+
+// Drop-in replacement for useLS — loads from Supabase, syncs on change
+function useSupabase(table, init) {
+  const [s, setS] = useState(init);
+  const [loaded, setLoaded] = useState(false);
+
+  useEffect(() => {
+    sbGet(table, init).then(v => { setS(v); setLoaded(true); });
+  }, [table]);
+
+  const setAndSync = (valOrFn) => {
+    setS(prev => {
+      const next = typeof valOrFn === "function" ? valOrFn(prev) : valOrFn;
+      sbSet(table, next);
+      return next;
+    });
+  };
+
+  return [s, setAndSync, loaded];
+}
 
 // ─── THEME ───────────────────────────────────────────────────────────────────
 const C = {
@@ -59,11 +101,6 @@ const DEFAULT_FIN = {
 };
 
 // ─── UTILS ───────────────────────────────────────────────────────────────────
-function useLS(key, init) {
-  const [s,setS] = useState(()=>{ try{ const v=localStorage.getItem(key); return v?JSON.parse(v):init; }catch{ return init; } });
-  useEffect(()=>{ try{ localStorage.setItem(key,JSON.stringify(s)); }catch{} },[key,s]);
-  return [s,setS];
-}
 const fmt  = (n,d=0)=>(+(n??0)).toLocaleString("en-US",{minimumFractionDigits:d,maximumFractionDigits:d});
 const fmtU = n=>`$${fmt(n)}`;
 const fmtP = (n,d=1)=>`${fmt(n,d)}%`;
@@ -1524,15 +1561,18 @@ function AccessTab({accessUsers,setAccessUsers}){
 export default function App(){
   const [userId,setUserId]=useState(null);
   const [activeTab,setActiveTab]=useState("Dashboard");
-  const [experts,setExperts]=useLS("nes5_experts",[]);
-  const [reviewers,setReviewers]=useLS("nes5_reviewers",[]);
-  const [opsTeam,setOpsTeam]=useLS("nes5_ops",[]);
-  const [tickets,setTickets]=useLS("nes5_tickets",[]);
-  const [financials,setFinancials]=useLS("nes5_financials",DEFAULT_FIN);
-  const [phaseFinancials,setPhaseFinancials]=useLS("nes5_phaseFinancials",{});
-  const [taskTracker,setTaskTracker]=useLS("nes5_tasks",[]);
-  const [rampData,setRampData]=useLS("nes5_ramp",RAMP_DEFAULT);
-  const [accessUsers,setAccessUsers]=useLS("nes5_access",[]);
+
+  const [experts,setExperts,l1]=useSupabase("experts",[]);
+  const [reviewers,setReviewers,l2]=useSupabase("reviewers",[]);
+  const [opsTeam,setOpsTeam,l3]=useSupabase("ops_team",[]);
+  const [tickets,setTickets,l4]=useSupabase("tickets",[]);
+  const [financials,setFinancials,l5]=useSupabase("financials",DEFAULT_FIN);
+  const [phaseFinancials,setPhaseFinancials,l6]=useSupabase("phase_financials",{});
+  const [taskTracker,setTaskTracker,l7]=useSupabase("task_tracker",[]);
+  const [rampData,setRampData,l8]=useSupabase("ramp_data",RAMP_DEFAULT);
+  const [accessUsers,setAccessUsers,l9]=useSupabase("access_users",[]);
+
+  const allLoaded=l1&&l2&&l3&&l4&&l5&&l6&&l7&&l8&&l9;
 
   const isAdmin=userId==="__admin__";
   const currentUser=accessUsers.find(u=>u.id===userId);
@@ -1540,7 +1580,21 @@ export default function App(){
 
   useEffect(()=>{ if(userId&&!visibleTabs.includes(activeTab)) setActiveTab(visibleTabs[0]||"Dashboard"); },[userId,visibleTabs.join(",")]);
 
-  const resetAll=()=>{ if(confirm("Reset ALL data? Cannot be undone.")){setExperts([]);setReviewers([]);setOpsTeam([]);setTickets([]);setFinancials(DEFAULT_FIN);setPhaseFinancials({});setTaskTracker([]);setRampData(RAMP_DEFAULT);setAccessUsers([]);} };
+  const resetAll=()=>{ if(confirm("Reset ALL data? Cannot be undone.")){
+    setExperts([]);setReviewers([]);setOpsTeam([]);setTickets([]);
+    setFinancials(DEFAULT_FIN);setPhaseFinancials({});setTaskTracker([]);
+    setRampData(RAMP_DEFAULT);setAccessUsers([]);
+  }};
+
+  if(!allLoaded) return(
+    <div style={{minHeight:"100vh",background:C.bg,display:"flex",alignItems:"center",justifyContent:"center",flexDirection:"column",gap:20}}>
+      <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700;800&family=DM+Mono:wght@400;500&display=swap" rel="stylesheet"/>
+      <style>{`@keyframes spin{to{transform:rotate(360deg)}}`}</style>
+      <div style={{width:48,height:48,border:`4px solid ${C.border}`,borderTop:`4px solid ${C.blue}`,borderRadius:"50%",animation:"spin 0.8s linear infinite"}}/>
+      <div style={{color:C.muted,fontSize:14,fontFamily:"'IBM Plex Sans',sans-serif"}}>Loading dashboard...</div>
+      <div style={{color:C.faint,fontSize:12,fontFamily:"'DM Mono',monospace"}}>Connecting to Supabase</div>
+    </div>
+  );
 
   if(!userId) return <PinLogin accessUsers={accessUsers} onLogin={setUserId}/>;
 
@@ -1566,7 +1620,6 @@ export default function App(){
   return(
     <div style={{minHeight:"100vh",width:"100%",background:C.bg,color:C.text,fontFamily:"'IBM Plex Sans','Segoe UI',system-ui,sans-serif"}}>
       <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700;800&family=DM+Mono:wght@400;500&display=swap" rel="stylesheet"/>
-      {/* Header — full width */}
       <div style={{background:C.navy,borderBottom:"1px solid #1e40af",position:"sticky",top:0,zIndex:100,width:"100%"}}>
         <div style={{padding:"0 24px",display:"flex",alignItems:"center",justifyContent:"space-between",height:56}}>
           <div style={{display:"flex",alignItems:"center",gap:12}}>
@@ -1581,7 +1634,6 @@ export default function App(){
             <button onClick={()=>setUserId(null)} style={{background:"transparent",border:"1px solid #334155",borderRadius:7,color:"#94a3b8",padding:"4px 12px",cursor:"pointer",fontSize:12}}>Log Out</button>
           </div>
         </div>
-        {/* Tabs */}
         <div style={{padding:"0 24px",display:"flex",gap:0,overflowX:"auto",width:"100%",boxSizing:"border-box"}}>
           {visibleTabs.map(tab=>(
             <button key={tab} onClick={()=>setActiveTab(tab)} style={{background:"none",border:"none",color:activeTab===tab?"#60a5fa":"#94a3b8",padding:"10px 14px",cursor:"pointer",fontSize:13,fontWeight:activeTab===tab?700:500,borderBottom:activeTab===tab?"2px solid #60a5fa":"2px solid transparent",transition:"all 0.12s",whiteSpace:"nowrap"}}>
@@ -1590,7 +1642,6 @@ export default function App(){
           ))}
         </div>
       </div>
-      {/* Content — full width with padding */}
       <div style={{padding:"28px 24px",width:"100%",boxSizing:"border-box"}}>
         {tabContent[activeTab]||<div style={{color:C.muted,textAlign:"center",padding:60}}>Access denied.</div>}
       </div>
