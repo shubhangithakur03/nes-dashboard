@@ -17,7 +17,7 @@ const sb = createClient(SUPA_URL, SUPA_KEY);
 // This keeps the schema dead-simple and avoids per-row complexity
 async function sbGet(table, fallback) {
   try {
-    const { data, error } = await sb.from(table).select("data").eq("id","singleton").single();
+    const { data, error } = await sb.from(table).select("data").eq("id","singleton").maybeSingle();
     if (error || !data) return fallback;
     return data.data ?? fallback;
   } catch { return fallback; }
