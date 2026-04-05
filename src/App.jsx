@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import {
   BarChart, Bar, LineChart, Line, PieChart, Pie, Cell, AreaChart, Area,
   XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer, ReferenceLine, RadarChart, Radar, PolarGrid, PolarAngleAxis, ScatterChart, Scatter
@@ -75,8 +75,8 @@ const PERSON_STATUSES = ["active","to-be-offboarded","inactive","offboarded"];
 const STATUS_SORT = { active:0, "to-be-offboarded":1, inactive:2, offboarded:3 };
 const STATUS_COLOR_MAP = { active:C.green, "to-be-offboarded":C.yellow, inactive:C.faint, offboarded:C.red };
 
-const ALL_TABS = ["Dashboard","Standup","Experts","Reviewers","Ops Team","Tickets","Tasks","Velocity","Quality Control","Ramp Plan","Financials","Visualizations","Risk","Access"];
-const CONTROLLABLE_TABS = ["Dashboard","Standup","Experts","Reviewers","Ops Team","Tickets","Tasks","Velocity","Quality Control","Ramp Plan","Visualizations","Risk"];
+const ALL_TABS = ["Dashboard","Standup","Experts","Reviewers","Ops Team","Tickets","Tasks","Velocity","Quality Control","Time Tracker","Ramp Plan","Financials","Visualizations","Risk","Access"];
+const CONTROLLABLE_TABS = ["Dashboard","Standup","Experts","Reviewers","Ops Team","Tickets","Tasks","Velocity","Quality Control","Time Tracker","Ramp Plan","Visualizations","Risk"];
 
 const PHASES = [
   { id:"p0_unified",    name:"P0 – Unified (Full)",   tasks:4000, revenue:250000, weeks:8, color:C.blue   },
@@ -100,12 +100,83 @@ const DEFAULT_FIN = {
   regionRates:{US:30,EU:22,LATAM:12,APAC:10,Other:15},
 };
 
+const TZ_OPTIONS = [
+  { label:"BST · GMT+1",    iana:"Europe/London",       abbr:"BST" },
+  { label:"IST · GMT+5:30", iana:"Asia/Kolkata",        abbr:"IST" },
+  { label:"EST · GMT-5",    iana:"America/New_York",    abbr:"EST" },
+  { label:"UTC · GMT+0",    iana:"UTC",                 abbr:"UTC" },
+  { label:"PST · GMT-8",    iana:"America/Los_Angeles", abbr:"PST" },
+  { label:"CET · GMT+2",    iana:"Europe/Berlin",       abbr:"CET" },
+];
+const QM_COLORS = [C.blue,C.purple,C.green,C.red,C.orange,C.cyan,C.teal,C.yellow,C.navy,"#ec4899"];
+
+const wallClockToUTC = (dateStr, timeStr, iana) => {
+  try {
+    if (!dateStr || !timeStr || !iana) return "";
+    const [y, m, d] = String(dateStr).split("-").map(Number);
+    const [hh, mm] = String(timeStr).split(":").map(Number);
+    if (![y, m, d, hh, mm].every(Number.isFinite)) return "";
+
+    const naiveUtcMs = Date.UTC(y, m - 1, d, hh, mm, 0, 0);
+    const naiveDate = new Date(naiveUtcMs);
+    const tzLocalString = naiveDate.toLocaleString("en-US", { timeZone: iana, hour12: false });
+    const tzAsLocalDate = new Date(tzLocalString);
+    if (Number.isNaN(tzAsLocalDate.getTime())) return "";
+
+    const offsetMs = tzAsLocalDate.getTime() - naiveUtcMs;
+    const correctedUtc = new Date(naiveUtcMs - offsetMs);
+    if (Number.isNaN(correctedUtc.getTime())) return "";
+    return correctedUtc.toISOString();
+  } catch {
+    return "";
+  }
+};
+
 // ─── UTILS ───────────────────────────────────────────────────────────────────
 const fmt  = (n,d=0)=>(+(n??0)).toLocaleString("en-US",{minimumFractionDigits:d,maximumFractionDigits:d});
-const fmtU = n=>`$${fmt(n)}`;
+const fmtU = (n,d=2)=>`$${fmt(n,d)}`;
 const fmtP = (n,d=1)=>`${fmt(n,d)}%`;
 const today = ()=>new Date().toISOString().split("T")[0];
 const daysSince = d=>d?Math.floor((Date.now()-new Date(d).getTime())/86400000):null;
+// ─── TIME-TRACKER HELPERS ────────────────────────────────────────────────────
+const fmtTZ=(iso,iana)=>{try{return new Intl.DateTimeFormat("en-GB",{timeZone:iana,weekday:"short",day:"2-digit",month:"short"}).format(new Date(iso));}catch{return"—";}};
+const fmtTimeTZ=(iso,iana)=>{try{return new Intl.DateTimeFormat("en-GB",{timeZone:iana,hour:"2-digit",minute:"2-digit",hour12:false}).format(new Date(iso));}catch{return"—";}};
+const isoDateInTZ=(iso,iana)=>{try{return new Intl.DateTimeFormat("en-CA",{timeZone:iana}).format(new Date(iso));}catch{return"";}};
+const hasDayShift=(iso,tzA,tzB)=>tzA&&tzB&&tzA!==tzB?isoDateInTZ(iso,tzA)!==isoDateInTZ(iso,tzB):false;
+const fmtElapsed=s=>{const h=Math.floor(s/3600),m=Math.floor((s%3600)/60),sec=s%60;return[h,m,sec].map(n=>String(n).padStart(2,"0")).join(":");};
+const durStr=(s,e)=>{const ms=new Date(e)-new Date(s);if(ms<=0)return"—";const h=Math.floor(ms/3600000),m=Math.floor((ms%3600000)/60000);return h>0?`${h}h ${m}m`:`${m}m`;};
+const weekBounds=(baseDate=new Date())=>{
+  const ws=new Date(baseDate);
+  const dow=ws.getDay();
+  ws.setDate(ws.getDate()-(dow===0?6:dow-1));
+  ws.setHours(0,0,0,0);
+  const we=new Date(ws);we.setDate(ws.getDate()+7);
+  return { weekStart:ws, weekEnd:we };
+};
+const opsMetricsById=(opsTeam,timeLogs,baseDate=new Date())=>{
+  const { weekStart, weekEnd }=weekBounds(baseDate);
+  const byId={};
+  opsTeam.forEach(o=>{byId[o.id]={approvedWeekHours:0,pendingWeekHours:0,approvedWeekPay:0,pendingWeekPay:0,totalApprovedPay:0,totalPendingPay:0};});
+  const statusOf=l=>l.approvalStatus||"approved";
+  timeLogs.forEach(l=>{
+    if(!l.endTime||!byId[l.qmId]) return;
+    const ms=new Date(l.endTime)-new Date(l.startTime);
+    if(ms<=0) return;
+    const hrs=ms/3600000;
+    const inWeek=new Date(l.startTime)>=weekStart&&new Date(l.startTime)<weekEnd;
+    const rate=l.hourlyRateSnapshot??(opsTeam.find(o=>o.id===l.qmId)?.hourlyRate||0);
+    const pay=hrs*rate;
+    const st=statusOf(l);
+    if(st==="approved"){
+      byId[l.qmId].totalApprovedPay+=pay;
+      if(inWeek){byId[l.qmId].approvedWeekHours+=hrs;byId[l.qmId].approvedWeekPay+=pay;}
+    }else if(st==="pending"){
+      byId[l.qmId].totalPendingPay+=pay;
+      if(inWeek){byId[l.qmId].pendingWeekHours+=hrs;byId[l.qmId].pendingWeekPay+=pay;}
+    }
+  });
+  return byId;
+};
 
 // ─── EXPORT ──────────────────────────────────────────────────────────────────
 function dlXLSX(sheets, fname="NES_Export") {
@@ -153,11 +224,11 @@ function InN({value,onChange,prefix="",suffix="",width="80px"}){
   </span>;
 }
 function Modal({title,onClose,children,width=520}){
-  return <div style={{position:"fixed",inset:0,background:"#0007",zIndex:9999,display:"flex",alignItems:"center",justifyContent:"center"}} onClick={e=>e.target===e.currentTarget&&onClose()}>
-    <div style={{background:C.surface,borderRadius:16,padding:32,width,maxWidth:"95vw",maxHeight:"90vh",overflowY:"auto",boxShadow:"0 20px 60px #0003"}}>
-      <div style={{display:"flex",justifyContent:"space-between",marginBottom:24}}>
-        <span style={{fontWeight:800,fontSize:18}}>{title}</span>
-        <button onClick={onClose} style={{background:"none",border:"none",color:C.muted,cursor:"pointer",fontSize:22}}>×</button>
+  return <div style={{position:"fixed",inset:0,background:"#0007",zIndex:9999,display:"flex",alignItems:"center",justifyContent:"center",padding:"12px"}} onClick={e=>e.target===e.currentTarget&&onClose()}>
+    <div className="modal-inner" style={{background:C.surface,borderRadius:16,padding:28,width,maxWidth:"96vw",maxHeight:"90vh",overflowY:"auto",boxShadow:"0 20px 60px #0003"}}>
+      <div style={{display:"flex",justifyContent:"space-between",marginBottom:20}}>
+        <span style={{fontWeight:800,fontSize:17}}>{title}</span>
+        <button onClick={onClose} style={{background:"none",border:"none",color:C.muted,cursor:"pointer",fontSize:22,lineHeight:1}}>×</button>
       </div>
       {children}
     </div>
@@ -222,7 +293,7 @@ function PinLogin({accessUsers,onLogin}){
 }
 
 // ─── PERSON TAB ──────────────────────────────────────────────────────────────
-function PersonTab({items,setItems,type,financials}){
+function PersonTab({items,setItems,type,financials,timeLogs=[]}){
   const isE=type==="expert", isR=type==="reviewer";
   const [search,setSearch]=useState(""); const [filterStatus,setFilterStatus]=useState("all");
   const [modal,setModal]=useState(false); const [editId,setEditId]=useState(null);
@@ -235,7 +306,7 @@ function PersonTab({items,setItems,type,financials}){
       tasksCompleted:0, lastWeekCompleted:0, qualityScore:0, avgSpeed:0,
       perTaskRate:0, bonusEarned:0, joinDate:"", qualityHistory:[],
     }:{},
-    ...(!isE&&!isR)?{role:"",responsibilities:"",weeklyHours:40,activityPct:0,completionRate:0,hourlyRate:0,totalPaidToDate:0}:{},
+    ...(!isE&&!isR)?{role:"",responsibilities:"",activityPct:0,hourlyRate:0}:{},
   });
   const [form,setForm]=useState(blank());
   const upd=(f,v)=>setForm(p=>({...p,[f]:v}));
@@ -268,6 +339,16 @@ function PersonTab({items,setItems,type,financials}){
   const threshold=financials?.qualityThreshold||90;
   const withAHT=items.filter(x=>x.avgSpeed>0);
   const avgAHT=withAHT.length?withAHT.reduce((s,x)=>s+x.avgSpeed,0)/withAHT.length:0;
+  const opsMetrics=!isE&&!isR?opsMetricsById(items,timeLogs,new Date()):{};
+  const opsTotals=!isE&&!isR?items.reduce((acc,o)=>{
+    const m=opsMetrics[o.id]||{};
+    acc.approvedWeekHours+=(m.approvedWeekHours||0);
+    acc.pendingWeekHours+=(m.pendingWeekHours||0);
+    acc.approvedWeekPay+=(m.approvedWeekPay||0);
+    acc.pendingWeekPay+=(m.pendingWeekPay||0);
+    acc.totalApprovedPay+=(m.totalApprovedPay||0);
+    return acc;
+  },{approvedWeekHours:0,pendingWeekHours:0,approvedWeekPay:0,pendingWeekPay:0,totalApprovedPay:0}):null;
 
   // Weekly delta = current total - last week total
   const weeklyDelta=(x)=>{
@@ -289,7 +370,8 @@ function PersonTab({items,setItems,type,financials}){
     {label:"Avg Quality",value:items.filter(x=>x.qualityScore>0).length?fmtP(items.filter(x=>x.qualityScore>0).reduce((s,x)=>s+x.qualityScore,0)/items.filter(x=>x.qualityScore>0).length):"—",icon:"⭐",color:C.green},
   ]:[
     {label:"Team Size",value:items.length,icon:"👔",color},
-    {label:"Total Pay (MTD)",value:fmtU(items.reduce((s,x)=>s+(x.totalPaidToDate||0),0)),icon:"💼",color:C.orange},
+    {label:"Approved Pay (All Time)",value:fmtU(opsTotals?.totalApprovedPay||0),icon:"💼",color:C.orange},
+    {label:"Pending Pay (This Week)",value:fmtU(opsTotals?.pendingWeekPay||0),icon:"🧾",color:C.yellow},
     {label:"Avg Activity",value:items.length>0?fmtP(items.reduce((s,x)=>s+(x.activityPct||0),0)/items.length):"—",icon:"📊",color:C.blue},
     {label:"Avg Hourly Rate",value:items.filter(x=>x.hourlyRate>0).length?fmtU(items.filter(x=>x.hourlyRate>0).reduce((s,x)=>s+x.hourlyRate,0)/items.filter(x=>x.hourlyRate>0).length):"—",icon:"💵",color:C.purple},
   ];
@@ -318,10 +400,64 @@ function PersonTab({items,setItems,type,financials}){
         </select>
         {(isE||isR)&&(
           <button onClick={()=>{
-            if(confirm("Roll week? This sets 'Last Week Total' to each contributor's current total. Do this at the end of every week.")){
+            if(confirm("Roll week? This sets 'Last Week Total' to each contributor's current total.")){
               setItems(p=>p.map(x=>({...x,lastWeekCompleted:isE?x.tasksCompleted:x.tasksReviewed})));
             }
           }} style={{...btnSm,background:C.teal,color:"#fff",border:"none"}}>🔄 Roll Week</button>
+        )}
+        {(isE||isR)&&(
+          <button onClick={()=>{
+            const input=document.createElement("input");
+            input.type="file";input.accept=".xlsx,.xls,.csv";
+            input.onchange=async(e)=>{
+              const file=e.target.files[0];if(!file)return;
+              const reader=new FileReader();
+              reader.onload=ev=>{
+                try{
+                  const wb=XLSX.read(ev.target.result,{type:"binary"});
+                  const ws=wb.Sheets[wb.SheetNames[0]];
+                  const rows=XLSX.utils.sheet_to_json(ws);
+                  if(!rows.length){alert("No data found in file.");return;}
+                  const imported=rows.map((r,i)=>({
+                    id:`${isE?"E":"R"}${String(Date.now()+i).slice(-6)}`,
+                    name:r["Name"]||r["name"]||"",
+                    status:(r["Status"]||r["status"]||"active").toLowerCase(),
+                    region:r["Region"]||r["region"]||"US",
+                    assignment:r["Assignment"]||r["assignment"]||"",
+                    joinDate:r["Join Date"]||r["joinDate"]||"",
+                    tasksCompleted:+(r["Current Total"]||r["tasksCompleted"]||0),
+                    tasksReviewed:+(r["Current Total"]||r["tasksReviewed"]||0),
+                    lastWeekCompleted:+(r["Last Week Total"]||r["lastWeekCompleted"]||0),
+                    qualityScore:+(r["Quality %"]||r["qualityScore"]||0),
+                    avgSpeed:+(r["Avg AHT (h)"]||r["avgSpeed"]||0),
+                    perTaskRate:+(r["Per-Task $"]||r["perTaskRate"]||0),
+                    bonusEarned:+(r["Bonus $"]||r["bonusEarned"]||0),
+                    qualityHistory:[],
+                  })).filter(x=>x.name.trim());
+                  if(!imported.length){alert("No valid rows found. Make sure the file has a 'Name' column.");return;}
+                  // Merge: update existing by name, add new ones
+                  setItems(prev=>{
+                    const updated=[...prev];
+                    const existingNames=new Map(prev.map(x=>[x.name.toLowerCase(),x]));
+                    const toAdd=[];
+                    imported.forEach(imp=>{
+                      const existing=existingNames.get(imp.name.toLowerCase());
+                      if(existing){
+                        const idx=updated.findIndex(x=>x.id===existing.id);
+                        if(idx>=0) updated[idx]={...existing,...imp,id:existing.id,qualityHistory:existing.qualityHistory||[]};
+                      } else {
+                        toAdd.push(imp);
+                      }
+                    });
+                    return [...updated,...toAdd];
+                  });
+                  alert(`✅ Imported ${imported.length} row(s). Existing entries updated by name match, new entries added.`);
+                }catch(err){alert("Import failed: "+err.message);}
+              };
+              reader.readAsBinaryString(file);
+            };
+            input.click();
+          }} style={{...btnSm,background:C.purple,color:"#fff",border:"none"}}>⬆ Import Excel</button>
         )}
         <ExBtn onClick={()=>{
           dlXLSX([{name:isE?"Experts":isR?"Reviewers":"Ops Team",data:items.map(x=>isE?({
@@ -336,9 +472,14 @@ function PersonTab({items,setItems,type,financials}){
             "Quality Trend":(x.qualityHistory||[]).map(h=>h.score).join("→")||"—",
           }):({
             ID:x.id,Name:x.name,Role:x.role,Status:x.status,Region:x.region,
-            "Weekly Hours":x.weeklyHours,"Hourly Rate ($)":x.hourlyRate,
-            "Weekly Pay ($)":x.weeklyHours*x.hourlyRate,"Total Paid ($)":x.totalPaidToDate||0,
-            "Activity %":x.activityPct,"Completion %":x.completionRate,
+            "Responsibilities":x.responsibilities||"",
+            "Approved Hrs/Wk":+(opsMetrics[x.id]?.approvedWeekHours||0).toFixed(2),
+            "Pending Hrs/Wk":+(opsMetrics[x.id]?.pendingWeekHours||0).toFixed(2),
+            "Hourly Rate ($)":x.hourlyRate,
+            "Approved Pay/Wk ($)":+(opsMetrics[x.id]?.approvedWeekPay||0).toFixed(2),
+            "Pending Pay/Wk ($)":+(opsMetrics[x.id]?.pendingWeekPay||0).toFixed(2),
+            "Total Approved Pay ($)":+(opsMetrics[x.id]?.totalApprovedPay||0).toFixed(2),
+            "Activity %":x.activityPct,
           }))}],"NES_Export");
         }} label={`⬇ Export ${isE?"Experts":isR?"Reviewers":"Ops Team"}`}/>
         <button onClick={openAdd} style={{...btnSm,background:color,color:"#fff",border:"none"}}>+ Add {isE?"Expert":isR?"Reviewer":"Ops Member"}</button>
@@ -348,14 +489,14 @@ function PersonTab({items,setItems,type,financials}){
         <table style={{width:"100%",borderCollapse:"collapse",minWidth:860}}>
           <TH cols={isE?["#","Name","Status","Region","Assignment","This Week","Total","Quality","AHT","Trend","$/task","Actions"]
             :isR?["#","Name","Status","Region","Assignment","This Week","Total","Quality","AHT","Trend","Actions"]
-            :["#","Name","Role","Region","Hrs/Wk","Rate ($/h)","Weekly Pay","Total Paid","Activity","Status","Actions"]}/>
+            :["#","Name","Role","Region","Responsibilities","Approved Hrs/Wk","Pending Hrs/Wk","Rate ($/h)","Approved Pay/Wk","Pending Pay/Wk","Total Approved Pay","Activity","Status","Actions"]}/>
           <tbody>
-            {filtered.length===0&&<tr><td colSpan={12} style={{padding:40,textAlign:"center",color:C.faint}}>No {type}s yet. Click "+ Add" to get started.</td></tr>}
+            {filtered.length===0&&<tr><td colSpan={14} style={{padding:40,textAlign:"center",color:C.faint}}>No {type}s yet. Click "+ Add" to get started.</td></tr>}
             {filtered.map((x,i)=>{
               const hist=(x.qualityHistory||[]).map(h=>h.score);
               const delta=weeklyDelta(x);
               const ahtFlag=avgAHT>0&&x.avgSpeed>0?(x.avgSpeed>avgAHT*1.3?"slow":x.avgSpeed<avgAHT*0.6?"fast":null):null;
-              const weeklyPay=(!isE&&!isR)?(x.weeklyHours||0)*(x.hourlyRate||0):null;
+              const m=!isE&&!isR?(opsMetrics[x.id]||{}):null;
               return(
                 <tr key={x.id} style={{borderTop:`1px solid ${C.border}`,background:i%2?"#fafafa":C.surface}}>
                   <td style={{padding:"10px 14px",color:C.faint,fontFamily:"'DM Mono',monospace",fontSize:12,width:40}}>{i+1}</td>
@@ -380,10 +521,12 @@ function PersonTab({items,setItems,type,financials}){
                     {isE&&<td style={{padding:"10px 14px",fontFamily:"'DM Mono',monospace"}}>{x.perTaskRate>0?fmtU(x.perTaskRate):"—"}</td>}
                   </>}
                   {(!isE&&!isR)&&<>
-                    <td style={{padding:"10px 14px",fontFamily:"'DM Mono',monospace"}}>{x.weeklyHours}h</td>
+                    <td style={{padding:"10px 14px",fontFamily:"'DM Mono',monospace"}}>{(m?.approvedWeekHours||0).toFixed(1)}h</td>
+                    <td style={{padding:"10px 14px",fontFamily:"'DM Mono',monospace",color:C.yellowText}}>{(m?.pendingWeekHours||0).toFixed(1)}h</td>
                     <td style={{padding:"10px 14px",fontFamily:"'DM Mono',monospace"}}>{x.hourlyRate>0?fmtU(x.hourlyRate):""}/h</td>
-                    <td style={{padding:"10px 14px",fontFamily:"'DM Mono',monospace",color:C.blue,fontWeight:700}}>{fmtU(weeklyPay||0)}</td>
-                    <td style={{padding:"10px 14px",fontFamily:"'DM Mono',monospace",color:C.orange}}>{fmtU(x.totalPaidToDate||0)}</td>
+                    <td style={{padding:"10px 14px",fontFamily:"'DM Mono',monospace",color:C.blue,fontWeight:700}}>{fmtU(m?.approvedWeekPay||0)}</td>
+                    <td style={{padding:"10px 14px",fontFamily:"'DM Mono',monospace",color:C.yellowText}}>{fmtU(m?.pendingWeekPay||0)}</td>
+                    <td style={{padding:"10px 14px",fontFamily:"'DM Mono',monospace",color:C.orange}}>{fmtU(m?.totalApprovedPay||0)}</td>
                     <td style={{padding:"10px 14px"}}>
                       <div style={{fontFamily:"'DM Mono',monospace",fontSize:13}}>{fmtP(x.activityPct||0)}</div>
                       <div style={{background:C.border,borderRadius:3,height:4,width:60,marginTop:3}}><div style={{background:(x.activityPct||0)>=80?C.green:C.yellow,height:4,borderRadius:3,width:`${Math.min(x.activityPct||0,100)}%`}}/></div>
@@ -429,20 +572,11 @@ function PersonTab({items,setItems,type,financials}){
             </>}
             {(!isE&&!isR)&&<>
               <FF label="Role"><input type="text" value={form.role} onChange={e=>upd("role",e.target.value)} style={iStyle}/></FF>
-              <FF label="Weekly Hours"><input type="number" value={form.weeklyHours} onChange={e=>upd("weeklyHours",+e.target.value||0)} style={iStyle}/></FF>
-              <FF label="Hourly Rate ($)"><input type="number" step="0.5" value={form.hourlyRate||0} onChange={e=>upd("hourlyRate",+e.target.value||0)} style={iStyle}/></FF>
-              <FF label="Total Paid to Date ($)"><input type="number" value={form.totalPaidToDate||0} onChange={e=>upd("totalPaidToDate",+e.target.value||0)} style={iStyle}/></FF>
+              <FF label="Hourly Rate ($/h)"><input type="number" step="0.5" value={form.hourlyRate||0} onChange={e=>upd("hourlyRate",+e.target.value||0)} style={iStyle}/></FF>
               <FF label="Activity %"><input type="number" value={form.activityPct} onChange={e=>upd("activityPct",Math.min(100,+e.target.value||0))} style={iStyle}/></FF>
-              <FF label="Completion %"><input type="number" value={form.completionRate} onChange={e=>upd("completionRate",Math.min(100,+e.target.value||0))} style={iStyle}/></FF>
               <div style={{gridColumn:"1/-1"}}><FF label="Responsibilities"><input type="text" value={form.responsibilities} onChange={e=>upd("responsibilities",e.target.value)} style={iStyle}/></FF></div>
             </>}
           </div>
-          {/* Weekly pay preview for ops */}
-          {(!isE&&!isR)&&(
-            <div style={{marginBottom:14,padding:12,background:C.blueSoft,borderRadius:8,display:"flex",gap:24}}>
-              <div><div style={{color:C.muted,fontSize:11,fontWeight:700}}>WEEKLY PAY</div><div style={{fontFamily:"'DM Mono',monospace",fontWeight:800,fontSize:18,color:C.blue}}>{fmtU((form.weeklyHours||0)*(form.hourlyRate||0))}</div></div>
-            </div>
-          )}
           {(isE||isR)&&form.qualityHistory?.length>0&&(
             <div style={{marginBottom:14,padding:12,background:"#f8fafc",borderRadius:8}}>
               <div style={{color:C.muted,fontSize:11,fontWeight:700,marginBottom:6}}>QUALITY HISTORY</div>
@@ -1081,7 +1215,7 @@ function RampPlanTab({rampData,setRampData}){
 }
 
 // ─── FINANCIALS ──────────────────────────────────────────────────────────────
-function FinancialsTab({experts,reviewers,opsTeam,financials,setFinancials,phaseFinancials,setPhaseFinancials,taskTracker}){
+function FinancialsTab({experts,reviewers,opsTeam,timeLogs,financials,setFinancials,phaseFinancials,setPhaseFinancials,taskTracker}){
   const [activePhase,setActivePhase]=useState("p0_unified");
   const updF=(f,v)=>setFinancials(p=>({...p,[f]:+v||0}));
   const updPF=(ph,f,v)=>setPhaseFinancials(p=>({...p,[ph]:{...(p[ph]||{}),[f]:+v||0}}));
@@ -1089,8 +1223,18 @@ function FinancialsTab({experts,reviewers,opsTeam,financials,setFinancials,phase
   const phase=PHASES.find(p=>p.id===activePhase);
   const regionRates=financials.regionRates||{US:30,EU:22,LATAM:12,APAC:10,Other:15};
   const updRegion=(r,v)=>setFinancials(p=>({...p,regionRates:{...(p.regionRates||{}),[r]:+v||0}}));
+  const opsMetrics=opsMetricsById(opsTeam,timeLogs||[],new Date());
+  const opsTotals=opsTeam.reduce((acc,o)=>{
+    const m=opsMetrics[o.id]||{};
+    acc.approvedWeekHours+=(m.approvedWeekHours||0);
+    acc.pendingWeekHours+=(m.pendingWeekHours||0);
+    acc.approvedWeekPay+=(m.approvedWeekPay||0);
+    acc.pendingWeekPay+=(m.pendingWeekPay||0);
+    acc.totalApprovedPay+=(m.totalApprovedPay||0);
+    return acc;
+  },{approvedWeekHours:0,pendingWeekHours:0,approvedWeekPay:0,pendingWeekPay:0,totalApprovedPay:0});
   const totalRev=PHASES.reduce((s,p)=>s+(phaseFinancials[p.id]?.revenue||p.revenue),0);
-  const totalCosts=experts.reduce((s,e)=>s+e.tasksCompleted*e.perTaskRate+e.bonusEarned,0)+reviewers.reduce((s,r)=>s+r.tasksReviewed*r.perTaskRate+r.bonusEarned,0)+opsTeam.reduce((s,o)=>s+(o.weeklyHours||0)*(o.hourlyRate||0)*4,0)+(financials.infrastructureCost||0)+(financials.otherOverhead||0);
+  const totalCosts=experts.reduce((s,e)=>s+e.tasksCompleted*e.perTaskRate+e.bonusEarned,0)+reviewers.reduce((s,r)=>s+r.tasksReviewed*r.perTaskRate+r.bonusEarned,0)+(opsTotals.totalApprovedPay||0)+(financials.infrastructureCost||0)+(financials.otherOverhead||0);
   const margin=totalRev>0?(totalRev-totalCosts)/totalRev*100:0;
   const weeksTracked=taskTracker.length;
   const totalDoneAcrossTracker=taskTracker.reduce((s,w)=>s+w.newAnnotators*w.tasksPerWeekAnnotator,0);
@@ -1111,7 +1255,7 @@ function FinancialsTab({experts,reviewers,opsTeam,financials,setFinancials,phase
       </div>
       <div style={{display:"flex",justifyContent:"flex-end"}}>
         <ExBtn onClick={()=>{
-          dlXLSX([{name:"Phase Summary",data:PHASES.map(p=>{const pf2=phaseFinancials[p.id]||{};const pc=["expertCost","reviewerCost","opsCost","infraCost","otherCost"].reduce((s,f)=>s+(pf2[f]||0),0);const pr=pf2.revenue||p.revenue;return{Phase:p.name,"Tasks":p.tasks,"Wks":p.weeks,"Revenue $":pr,"Budget $":pf2.budget||0,"Expert $":pf2.expertCost||0,"Reviewer $":pf2.reviewerCost||0,"Ops $":pf2.opsCost||0,"Infra $":pf2.infraCost||0,"Other $":pf2.otherCost||0,"Total Cost $":pc,"Margin %":pr>0?((pr-pc)/pr*100).toFixed(1):"—"};})},{name:"Regional Rates",data:["US","EU","LATAM","APAC","Other"].map(r=>({Region:r,"$/task":regionRates[r]||0,Experts:experts.filter(e=>e.region===r).length,Reviewers:reviewers.filter(x=>x.region===r).length,Ops:opsTeam.filter(x=>x.region===r).length}))},{name:"Ops Pay",data:opsTeam.map(o=>({Name:o.name,Role:o.role,"$/h":o.hourlyRate||0,"Hrs/Wk":o.weeklyHours||0,"Weekly Pay $":(o.weeklyHours||0)*(o.hourlyRate||0),"Total Paid $":o.totalPaidToDate||0}))}],"NES_Financials");
+          dlXLSX([{name:"Phase Summary",data:PHASES.map(p=>{const pf2=phaseFinancials[p.id]||{};const pc=["expertCost","reviewerCost","opsCost","infraCost","otherCost"].reduce((s,f)=>s+(pf2[f]||0),0);const pr=pf2.revenue||p.revenue;return{Phase:p.name,"Tasks":p.tasks,"Wks":p.weeks,"Revenue $":pr,"Budget $":pf2.budget||0,"Expert $":pf2.expertCost||0,"Reviewer $":pf2.reviewerCost||0,"Ops $":pf2.opsCost||0,"Infra $":pf2.infraCost||0,"Other $":pf2.otherCost||0,"Total Cost $":pc,"Margin %":pr>0?((pr-pc)/pr*100).toFixed(1):"—"};})},{name:"Regional Rates",data:["US","EU","LATAM","APAC","Other"].map(r=>({Region:r,"$/task":regionRates[r]||0,Experts:experts.filter(e=>e.region===r).length,Reviewers:reviewers.filter(x=>x.region===r).length,Ops:opsTeam.filter(x=>x.region===r).length}))},{name:"Ops Pay",data:opsTeam.map(o=>{const m=opsMetrics[o.id]||{};return{Name:o.name,Role:o.role,"$/h":o.hourlyRate||0,"Approved Hrs/Wk":+(m.approvedWeekHours||0).toFixed(2),"Pending Hrs/Wk":+(m.pendingWeekHours||0).toFixed(2),"Approved Pay/Wk $":+(m.approvedWeekPay||0).toFixed(2),"Pending Pay/Wk $":+(m.pendingWeekPay||0).toFixed(2),"Total Approved Pay $":+(m.totalApprovedPay||0).toFixed(2)};})}],"NES_Financials");
         }} label="⬇ Export Financials"/>
       </div>
       <Card title="Phase-by-Phase Financials">
@@ -1189,27 +1333,30 @@ function FinancialsTab({experts,reviewers,opsTeam,financials,setFinancials,phase
       {/* Ops Pay Summary */}
       <Card title="Ops Team Pay Summary">
         <table style={{width:"100%",borderCollapse:"collapse"}}>
-          <TH cols={["#","Name","Role","Hrs/Wk","Hourly Rate","Weekly Pay","Total Paid to Date"]}/>
+          <TH cols={["#","Name","Role","Approved Hrs/Wk","Pending Hrs/Wk","Hourly Rate","Approved Pay/Wk","Pending Pay/Wk","Total Approved Pay"]}/>
           <tbody>
-            {opsTeam.length===0&&<tr><td colSpan={7} style={{padding:30,textAlign:"center",color:C.faint}}>Add ops members to see pay summary.</td></tr>}
+            {opsTeam.length===0&&<tr><td colSpan={9} style={{padding:30,textAlign:"center",color:C.faint}}>Add ops members to see pay summary.</td></tr>}
             {opsTeam.map((o,i)=>{
-              const weeklyPay=(o.weeklyHours||0)*(o.hourlyRate||0);
+              const m=opsMetrics[o.id]||{};
               return(
                 <tr key={o.id} style={{borderTop:`1px solid ${C.border}`,background:i%2?"#fafafa":C.surface}}>
                   <td style={{padding:"10px 14px",color:C.faint,fontFamily:"'DM Mono',monospace",fontSize:12,width:40}}>{i+1}</td>
                   <td style={{padding:"10px 14px",fontWeight:700}}>{o.name}</td>
                   <td style={{padding:"10px 14px",color:C.muted,fontSize:13}}>{o.role}</td>
-                  <td style={{padding:"10px 14px",fontFamily:"'DM Mono',monospace"}}>{o.weeklyHours||0}h</td>
+                  <td style={{padding:"10px 14px",fontFamily:"'DM Mono',monospace"}}>{(m.approvedWeekHours||0).toFixed(1)}h</td>
+                  <td style={{padding:"10px 14px",fontFamily:"'DM Mono',monospace",color:C.yellowText}}>{(m.pendingWeekHours||0).toFixed(1)}h</td>
                   <td style={{padding:"10px 14px",fontFamily:"'DM Mono',monospace"}}>{o.hourlyRate>0?fmtU(o.hourlyRate)+"/h":"—"}</td>
-                  <td style={{padding:"10px 14px",fontFamily:"'DM Mono',monospace",color:C.blue,fontWeight:700}}>{fmtU(weeklyPay)}</td>
-                  <td style={{padding:"10px 14px",fontFamily:"'DM Mono',monospace",color:C.orange}}>{fmtU(o.totalPaidToDate||0)}</td>
+                  <td style={{padding:"10px 14px",fontFamily:"'DM Mono',monospace",color:C.blue,fontWeight:700}}>{fmtU(m.approvedWeekPay||0)}</td>
+                  <td style={{padding:"10px 14px",fontFamily:"'DM Mono',monospace",color:C.yellowText}}>{fmtU(m.pendingWeekPay||0)}</td>
+                  <td style={{padding:"10px 14px",fontFamily:"'DM Mono',monospace",color:C.orange}}>{fmtU(m.totalApprovedPay||0)}</td>
                 </tr>
               );
             })}
             {opsTeam.length>0&&<tr style={{borderTop:`2px solid ${C.border}`,background:"#f8fafc"}}>
-              <td colSpan={5} style={{padding:"10px 14px",fontWeight:800,textAlign:"right"}}>Total Weekly:</td>
-              <td style={{padding:"10px 14px",fontFamily:"'DM Mono',monospace",fontWeight:800,color:C.blue}}>{fmtU(opsTeam.reduce((s,o)=>s+(o.weeklyHours||0)*(o.hourlyRate||0),0))}</td>
-              <td style={{padding:"10px 14px",fontFamily:"'DM Mono',monospace",fontWeight:800,color:C.orange}}>{fmtU(opsTeam.reduce((s,o)=>s+(o.totalPaidToDate||0),0))}</td>
+              <td colSpan={6} style={{padding:"10px 14px",fontWeight:800,textAlign:"right"}}>Totals:</td>
+              <td style={{padding:"10px 14px",fontFamily:"'DM Mono',monospace",fontWeight:800,color:C.blue}}>{fmtU(opsTotals.approvedWeekPay||0)}</td>
+              <td style={{padding:"10px 14px",fontFamily:"'DM Mono',monospace",fontWeight:800,color:C.yellowText}}>{fmtU(opsTotals.pendingWeekPay||0)}</td>
+              <td style={{padding:"10px 14px",fontFamily:"'DM Mono',monospace",fontWeight:800,color:C.orange}}>{fmtU(opsTotals.totalApprovedPay||0)}</td>
             </tr>}
           </tbody>
         </table>
@@ -1311,7 +1458,7 @@ function DashboardTab({experts,reviewers,opsTeam,tickets,financials,taskTracker}
 }
 
 // ─── VISUALIZATIONS ──────────────────────────────────────────────────────────
-function VisualizationsTab({experts,reviewers,tickets,financials,taskTracker,opsTeam}){
+function VisualizationsTab({experts,reviewers,tickets,financials,taskTracker,opsTeam,timeLogs}){
   const ticketData=TICKET_STATUSES.map(s=>({name:s.split("/")[0],value:tickets.filter(t=>t.status===s).length,color:STATUS_COLORS[s]}));
   const qualityData=[...experts,...reviewers].filter(x=>x.qualityScore>0).map(x=>({name:x.name.split(" ")[0],quality:x.qualityScore,type:experts.includes(x)?"Expert":"Reviewer"}));
   const regionData=["US","EU","LATAM","APAC","Other"].map(r=>({region:r,experts:experts.filter(e=>e.region===r).length,reviewers:reviewers.filter(x=>x.region===r).length})).filter(x=>x.experts+x.reviewers>0);
@@ -1320,7 +1467,8 @@ function VisualizationsTab({experts,reviewers,tickets,financials,taskTracker,ops
   const statusCounts=PERSON_STATUSES.map(s=>({status:s,experts:experts.filter(e=>e.status===s).length,reviewers:reviewers.filter(r=>r.status===s).length})).filter(x=>x.experts+x.reviewers>0);
   const weeklyTrend=taskTracker.map(w=>({week:w.label,attempts:w.newAnnotators*w.tasksPerWeekAnnotator,reviews:w.newReviewers*w.tasksPerWeekReviewer}));
   const ahtData=[...experts,...reviewers].filter(x=>x.avgSpeed>0).map(x=>({name:x.name.split(" ")[0],aht:x.avgSpeed,quality:x.qualityScore,type:experts.includes(x)?"Expert":"Reviewer"}));
-  const opsWeeklyPay=opsTeam.map(o=>({name:o.name.split(" ")[0],weeklyPay:(o.weeklyHours||0)*(o.hourlyRate||0),totalPaid:o.totalPaidToDate||0})).filter(x=>x.weeklyPay>0||x.totalPaid>0);
+  const opsMetrics=opsMetricsById(opsTeam,timeLogs||[],new Date());
+  const opsWeeklyPay=opsTeam.map(o=>({name:o.name.split(" ")[0],weeklyPay:(opsMetrics[o.id]?.approvedWeekPay||0),pendingPay:(opsMetrics[o.id]?.pendingWeekPay||0),totalPaid:(opsMetrics[o.id]?.totalApprovedPay||0)})).filter(x=>x.weeklyPay>0||x.pendingPay>0||x.totalPaid>0);
 
   const chart={background:C.surface,border:`1px solid ${C.border}`,borderRadius:12,padding:22};
   const ct={color:C.muted,fontSize:11,fontWeight:700,letterSpacing:"0.07em",textTransform:"uppercase",marginBottom:16};
@@ -1372,7 +1520,7 @@ function VisualizationsTab({experts,reviewers,tickets,financials,taskTracker,ops
 }
 
 // ─── RISK ────────────────────────────────────────────────────────────────────
-function RiskTab({experts,reviewers,tickets,financials,opsTeam,taskTracker,rampData,phaseFinancials}){
+function RiskTab({experts,reviewers,tickets,financials,opsTeam,timeLogs,taskTracker,rampData,phaseFinancials}){
   const threshold=financials.qualityThreshold||90;
   const targetMargin=financials.targetMargin||35;
   const all=[...experts,...reviewers];
@@ -1403,7 +1551,9 @@ function RiskTab({experts,reviewers,tickets,financials,opsTeam,taskTracker,rampD
   const rampSBQ=rampData[0]?rampData[0].sbqDefault:null;
   const sbqDrift=avgSBQ&&rampSBQ?((avgSBQ-rampSBQ)/rampSBQ*100):null;
   const totalRev=PHASES.reduce((s,p)=>s+(phaseFinancials[p.id]?.revenue||p.revenue),0);
-  const totalCosts=experts.reduce((s,e)=>s+e.tasksCompleted*e.perTaskRate+e.bonusEarned,0)+reviewers.reduce((s,r)=>s+r.tasksReviewed*r.perTaskRate+r.bonusEarned,0)+opsTeam.reduce((s,o)=>s+(o.weeklyHours||0)*(o.hourlyRate||0)*4,0)+(financials.infrastructureCost||0)+(financials.otherOverhead||0);
+  const opsMetrics=opsMetricsById(opsTeam,timeLogs||[],new Date());
+  const opsApprovedTotal=opsTeam.reduce((s,o)=>s+(opsMetrics[o.id]?.totalApprovedPay||0),0);
+  const totalCosts=experts.reduce((s,e)=>s+e.tasksCompleted*e.perTaskRate+e.bonusEarned,0)+reviewers.reduce((s,r)=>s+r.tasksReviewed*r.perTaskRate+r.bonusEarned,0)+opsApprovedTotal+(financials.infrastructureCost||0)+(financials.otherOverhead||0);
   const margin=totalRev>0?(totalRev-totalCosts)/totalRev*100:null;
   const bonusPotential=(financials.bonusTiers||[]).reduce((s,tier)=>s+experts.filter(e=>e.tasksCompleted>=tier.minTasks&&e.qualityScore>=tier.minQuality).length*tier.bonusAmt,0);
   const toBeOffboarded=experts.filter(e=>e.status==="to-be-offboarded").length+reviewers.filter(r=>r.status==="to-be-offboarded").length;
@@ -1557,6 +1707,657 @@ function AccessTab({accessUsers,setAccessUsers}){
   );
 }
 
+// ─── TIME TRACKER ─────────────────────────────────────────────────────────────
+function TimeTrackerTab({timeLogs,setTimeLogs,qmSettings,setQmSettings,availEvents,setAvailEvents,opsTeam,accessUsers,currentUser,isAdmin}){
+  const [subTab,setSubTab]=useState("log");
+  const [viewTz,setViewTz]=useState("Europe/London");
+  const [filterQm,setFilterQm]=useState("all");
+  const [now,setNow]=useState(new Date());
+  const [timer,setTimer]=useState({running:false,hasSession:false,sessionStartISO:null,adjustedStartISO:null,pausedElapsedMs:0,qmId:currentUser?.id||opsTeam[0]?.id||"",notes:"",activeLogId:null});
+  const [addEventModal,setAddEventModal]=useState(false);
+  const [eventForm,setEventForm]=useState({qmId:isAdmin?"all":(currentUser?.id||""),type:"available",label:"",startTime:"",endTime:""});
+  const [colorPickerFor,setColorPickerFor]=useState(null);
+  const [manualModal,setManualModal]=useState(false);
+  const [manualForm,setManualForm]=useState({qmId:currentUser?.id||"",date:"",startAt:"",endAt:"",notes:""});
+  const [editModal,setEditModal]=useState(false);
+  const [editForm,setEditForm]=useState({id:"",qmId:"",startTime:"",endTime:"",notes:""});
+  const [rejectModal,setRejectModal]=useState(false);
+  const [rejectLogId,setRejectLogId]=useState(null);
+  const [rejectReason,setRejectReason]=useState("");
+  const TAB_ID = useRef(
+    sessionStorage.getItem("nesTabId") || (() => {
+      const id = Math.random().toString(36).slice(2);
+      sessionStorage.setItem("nesTabId", id);
+      return id;
+    })()
+  ).current;
+
+  const isEditor=currentUser?.role==="editor";
+  const myQmId=currentUser?.id||"";
+  const myQmById=opsTeam.find(o=>o.id===myQmId);
+  const myQmByName=opsTeam.find(o=>(o.name||"").trim().toLowerCase()===(currentUser?.name||"").trim().toLowerCase());
+  const myQm=myQmById||myQmByName||null;
+  const resolvedQmId=myQm?.id||myQmId;
+  const fallbackMyQm=(!isAdmin&&isEditor&&resolvedQmId)?(myQm||{id:resolvedQmId,name:currentUser?.name||"My QM",role:"QM",region:"—",status:"active",hourlyRate:0}):null;
+  const isScopedQM=!isAdmin&&isEditor;
+
+  const logsInScope=isAdmin?timeLogs:timeLogs.filter(l=>l.qmId===myQmId||l.qmId===resolvedQmId);
+  const eventsInScope=isAdmin?availEvents:availEvents.filter(e=>e.qmId===myQmId||e.qmId===resolvedQmId);
+  const qmsInScope=isAdmin?opsTeam:(fallbackMyQm?[fallbackMyQm]:[]);
+
+  const logStatus=l=>l.approvalStatus||"approved";
+  const toIsoFromDateAndTime=(d,t)=>{
+    if(!d||!t) return "";
+    const iso=wallClockToUTC(d,t,viewTz);
+    if(iso) return iso;
+    const dt=new Date(`${d}T${t}`);
+    if(Number.isNaN(dt.getTime())) return "";
+    return dt.toISOString();
+  };
+  const toLocalInputValue=iso=>{
+    if(!iso) return "";
+    const d=new Date(iso);
+    if(Number.isNaN(d.getTime())) return "";
+    const y=d.getFullYear();
+    const m=String(d.getMonth()+1).padStart(2,"0");
+    const day=String(d.getDate()).padStart(2,"0");
+    const hh=String(d.getHours()).padStart(2,"0");
+    const mm=String(d.getMinutes()).padStart(2,"0");
+    return `${y}-${m}-${day}T${hh}:${mm}`;
+  };
+  const pushHistory=(log,action,note="")=>[
+    ...(log.editHistory||[]),
+    { at:new Date().toISOString(), by:isAdmin?"__admin__":(currentUser?.id||"unknown"), action, note }
+  ];
+  const hoursForLog=l=>{
+    const ms=(new Date(l.endTime)-new Date(l.startTime));
+    if(!l.endTime||ms<=0) return 0;
+    return ms/3600000;
+  };
+  const payForLog=l=>{
+    const qm=opsTeam.find(o=>o.id===l.qmId)||(l.qmId===myQmId?fallbackMyQm:null);
+    const rate=l.hourlyRateSnapshot??(qm?.hourlyRate||0);
+    return hoursForLog(l)*rate;
+  };
+
+  // Single interval drives both live clock and elapsed display
+  useEffect(()=>{const t=setInterval(()=>setNow(new Date()),1000);return()=>clearInterval(t);},[]);
+
+  // Restore any active (unfinished) session in current scope
+  useEffect(()=>{
+    const active=logsInScope.find(l=>!l.endTime);
+    if(active){setTimer({running:true,hasSession:true,sessionStartISO:active.startTime,adjustedStartISO:active.startTime,pausedElapsedMs:0,qmId:active.qmId,notes:active.notes||"",activeLogId:active.id});}
+  },[myQmId,isAdmin]);// eslint-disable-line react-hooks/exhaustive-deps
+
+  useEffect(()=>{
+    if(!isAdmin&&resolvedQmId){
+      setFilterQm(resolvedQmId);
+      setTimer(t=>({...t,qmId:t.hasSession?t.qmId:resolvedQmId}));
+      setManualForm(f=>({...f,qmId:resolvedQmId}));
+      setEventForm(f=>({...f,qmId:resolvedQmId}));
+    }
+  },[isAdmin,resolvedQmId]);
+
+  const getQm=id=>opsTeam.find(o=>o.id===id)||(id===myQmId?fallbackMyQm:null);
+  const getAccessUser=id=>(accessUsers||[]).find(u=>u.id===id);
+  const getQmName=id=>getQm(id)?.name||getAccessUser(id)?.name||String(id);
+  const getQmCfg=id=>qmSettings.find(s=>s.qmId===id)||{color:C.blue,homeTz:"UTC"};
+  const tzAbbrFor=iana=>TZ_OPTIONS.find(t=>t.iana===iana)?.abbr||iana;
+  const viewAbbr=tzAbbrFor(viewTz);
+
+  // Elapsed derived from `now` — no separate setInterval needed
+  const elapsedMs=timer.running&&timer.adjustedStartISO?Math.max(0,now.getTime()-new Date(timer.adjustedStartISO).getTime()):timer.pausedElapsedMs;
+  const elapsedSec=Math.floor(elapsedMs/1000);
+
+  const startTimer=()=>{
+    const nowISO=new Date().toISOString();
+    if(!timer.hasSession){
+      const newId="TL"+Date.now();
+      const rate=(getQm(timer.qmId)?.hourlyRate||0);
+      setTimeLogs(prev=>[{id:newId,qmId:timer.qmId,startTime:nowISO,endTime:null,notes:timer.notes,source:"timer",approvalStatus:"approved",hourlyRateSnapshot:rate,lockedBy:TAB_ID},...prev]);
+      setTimer(t=>({...t,running:true,hasSession:true,sessionStartISO:nowISO,adjustedStartISO:nowISO,pausedElapsedMs:0,activeLogId:newId}));
+    } else {
+      // Resume: shift adjustedStartISO so elapsed continues from where it paused
+      const resumed=new Date(Date.now()-timer.pausedElapsedMs).toISOString();
+      setTimer(t=>({...t,running:true,adjustedStartISO:resumed}));
+    }
+  };
+  const pauseTimer=()=>{
+    const activeLog = timeLogs.find(l => l.id === timer.activeLogId);
+    if (activeLog && activeLog.lockedBy && activeLog.lockedBy !== TAB_ID) {
+      alert("This session is active in another tab. Please use that tab to control the timer.");
+      return;
+    }
+    const elapsed=Math.max(0,now.getTime()-new Date(timer.adjustedStartISO).getTime());
+    setTimer(t=>({...t,running:false,pausedElapsedMs:elapsed}));
+  };
+  const stopTimer=()=>{
+    const activeLog = timeLogs.find(l => l.id === timer.activeLogId);
+    if (activeLog && activeLog.lockedBy && activeLog.lockedBy !== TAB_ID) {
+      alert("This session is active in another tab. Please use that tab to control the timer.");
+      return;
+    }
+    const endTime=new Date().toISOString();
+    setTimeLogs(prev=>prev.map(l=>l.id===timer.activeLogId?{...l,endTime,notes:timer.notes,approvalStatus:logStatus(l),editHistory:pushHistory(l,"timer_stop","Timer session completed")} :l));
+    setTimer({running:false,hasSession:false,sessionStartISO:null,adjustedStartISO:null,pausedElapsedMs:0,qmId:timer.qmId,notes:"",activeLogId:null});
+  };
+
+  const updateQmCfg=(qmId,patch)=>setQmSettings(prev=>{
+    const exists=prev.find(s=>s.qmId===qmId);
+    if(exists)return prev.map(s=>s.qmId===qmId?{...s,...patch}:s);
+    return[...prev,{qmId,color:C.blue,homeTz:"UTC",...patch}];
+  });
+
+  // Week boundaries (Mon–Sun) for calendar + KPIs
+  const weekStart=new Date(now);
+  const dow=weekStart.getDay();
+  weekStart.setDate(weekStart.getDate()-(dow===0?6:dow-1));
+  weekStart.setHours(0,0,0,0);
+  const weekEnd=new Date(weekStart);weekEnd.setDate(weekStart.getDate()+7);
+  const weekDays=Array.from({length:7},(_,i)=>{const d=new Date(weekStart);d.setDate(weekStart.getDate()+i);return d;});
+
+  const msToDur=ms=>{const h=Math.floor(ms/3600000),m=Math.floor((ms%3600000)/60000);return h>0?`${h}h ${m}m`:`${m}m`;};
+  const msClippedToDay = (log, dayDate, iana) => {
+    if (!log.endTime) return 0;
+    const dayStr = isoDateInTZ(dayDate.toISOString(), iana);
+    const [y, m, d] = dayStr.split("-").map(Number);
+    if (![y, m, d].every(Number.isFinite)) return 0;
+    const pad = n => String(n).padStart(2, "0");
+    const dayStartIso = wallClockToUTC(`${y}-${pad(m)}-${pad(d)}`, "00:00", iana);
+    const dayAnchor = new Date(Date.UTC(y, m - 1, d));
+    dayAnchor.setUTCDate(dayAnchor.getUTCDate() + 1);
+    const ny = dayAnchor.getUTCFullYear();
+    const nm = dayAnchor.getUTCMonth() + 1;
+    const nd = dayAnchor.getUTCDate();
+    const nextStartIso = wallClockToUTC(`${ny}-${pad(nm)}-${pad(nd)}`, "00:00", iana);
+
+    const s = new Date(log.startTime).getTime();
+    const e = new Date(log.endTime).getTime();
+    const dayStart = new Date(dayStartIso || log.startTime).getTime();
+    const nextStart = new Date(nextStartIso || log.endTime).getTime();
+    if (![s, e, dayStart, nextStart].every(Number.isFinite)) return 0;
+
+    return Math.max(0, Math.min(e, nextStart) - Math.max(s, dayStart));
+  };
+  const approvedLogsInScope=logsInScope.filter(l=>l.endTime&&logStatus(l)==="approved");
+  const pendingLogsInScope=logsInScope.filter(l=>l.endTime&&logStatus(l)==="pending");
+  const rejectedLogsInScope=logsInScope.filter(l=>l.endTime&&logStatus(l)==="rejected");
+
+  const myHours=approvedLogsInScope.filter(l=>new Date(l.startTime)>=weekStart&&new Date(l.startTime)<weekEnd).reduce((s,l)=>s+(new Date(l.endTime)-new Date(l.startTime)),0);
+  const pendingHours=pendingLogsInScope.filter(l=>new Date(l.startTime)>=weekStart&&new Date(l.startTime)<weekEnd).reduce((s,l)=>s+(new Date(l.endTime)-new Date(l.startTime)),0);
+  const myPayWeek=approvedLogsInScope.filter(l=>new Date(l.startTime)>=weekStart&&new Date(l.startTime)<weekEnd).reduce((s,l)=>s+payForLog(l),0);
+  const pendingPayWeek=pendingLogsInScope.filter(l=>new Date(l.startTime)>=weekStart&&new Date(l.startTime)<weekEnd).reduce((s,l)=>s+payForLog(l),0);
+  const approvedPayTotal=approvedLogsInScope.reduce((s,l)=>s+payForLog(l),0);
+  const pendingPayTotal=pendingLogsInScope.reduce((s,l)=>s+payForLog(l),0);
+
+  const activeSessions=logsInScope.filter(l=>!l.endTime).length;
+  const upcomingDeadlines=eventsInScope.filter(e=>e.type==="deadline"&&new Date(e.startTime)>now&&new Date(e.startTime)<new Date(now.getTime()+7*86400000)).length;
+
+  const activeQMs=qmsInScope.filter(o=>o.status==="active");
+  const filteredLogs=(isAdmin?(filterQm==="all"?logsInScope:logsInScope.filter(l=>l.qmId===filterQm)):logsInScope).slice().sort((a,b)=>new Date(b.startTime)-new Date(a.startTime));
+  const getEventsOnDay=d=>{const ds=isoDateInTZ(d.toISOString(),viewTz);return eventsInScope.filter(e=>isoDateInTZ(e.startTime,viewTz)===ds);};
+
+  const openEditLog=(log)=>{
+    setEditForm({id:log.id,qmId:log.qmId,startTime:toLocalInputValue(log.startTime),endTime:toLocalInputValue(log.endTime),notes:log.notes||""});
+    setEditModal(true);
+  };
+  const saveEditedLog=()=>{
+    if(!editForm.startTime||!editForm.endTime) return;
+    const startIso=new Date(editForm.startTime).toISOString();
+    const endIso=new Date(editForm.endTime).toISOString();
+    if(new Date(endIso)<=new Date(startIso)) return;
+    setTimeLogs(prev=>prev.map(l=>{
+      if(l.id!==editForm.id) return l;
+      const editedByAdmin=isAdmin;
+      const nextStatus=editedByAdmin?logStatus(l):(logStatus(l)==="approved"?"pending":logStatus(l));
+      const note=editedByAdmin?"Admin edited log entry":"QM edited own log entry";
+      return {
+        ...l,
+        qmId:editedByAdmin?editForm.qmId:l.qmId,
+        startTime:startIso,
+        endTime:endIso,
+        notes:editForm.notes,
+        hourlyRateSnapshot:editedByAdmin&&editForm.qmId!==l.qmId?(getQm(editForm.qmId)?.hourlyRate||0):(l.hourlyRateSnapshot??(getQm(l.qmId)?.hourlyRate||0)),
+        approvalStatus:nextStatus,
+        rejectionReason:nextStatus==="pending"?"":(l.rejectionReason||""),
+        editHistory:pushHistory(l,"edit",note)
+      };
+    }));
+    setEditModal(false);
+  };
+  const approveManual=(id)=>{
+    setTimeLogs(prev=>prev.map(l=>l.id===id?{
+      ...l,
+      approvalStatus:"approved",
+      approvedAt:new Date().toISOString(),
+      approvedBy:"__admin__",
+      rejectionReason:"",
+      editHistory:pushHistory(l,"approve","Manual time approved by admin")
+    }:l));
+  };
+  const rejectManual=()=>{
+    if(!rejectLogId) return;
+    setTimeLogs(prev=>prev.map(l=>l.id===rejectLogId?{
+      ...l,
+      approvalStatus:"rejected",
+      reviewedAt:new Date().toISOString(),
+      reviewedBy:"__admin__",
+      rejectionReason:rejectReason,
+      editHistory:pushHistory(l,"reject",rejectReason||"Rejected by admin")
+    }:l));
+    setRejectModal(false);
+    setRejectLogId(null);
+    setRejectReason("");
+  };
+  const cancelManualRequest=(id)=>{
+    setTimeLogs(prev=>prev.map(l=>{
+      if(l.id!==id) return l;
+      if(logStatus(l)!=="pending"||l.source!=="manual") return l;
+      return {
+        ...l,
+        approvalStatus:"cancelled",
+        cancelledAt:new Date().toISOString(),
+        cancelledBy:currentUser?.id||"unknown",
+        editHistory:pushHistory(l,"cancel_request","QM cancelled pending manual request")
+      };
+    }));
+  };
+  const submitManualTime=()=>{
+    if(!manualForm.qmId||!manualForm.date||!manualForm.startAt||!manualForm.endAt) return;
+    if(!manualForm.notes||!manualForm.notes.trim()){alert("Session notes are required. Please describe what you worked on during this time.");return;}
+    const startIso=toIsoFromDateAndTime(manualForm.date,manualForm.startAt);
+    const endIso=toIsoFromDateAndTime(manualForm.date,manualForm.endAt);
+    if(!startIso||!endIso) return;
+    if(new Date(endIso)<=new Date(startIso)) return;
+    const isAdminSubmit=isAdmin;
+    const status=isAdminSubmit?"approved":"pending";
+    const newId="TL"+Date.now();
+    const rate=(getQm(manualForm.qmId)?.hourlyRate||0);
+    setTimeLogs(prev=>[{id:newId,qmId:manualForm.qmId,startTime:startIso,endTime:endIso,notes:manualForm.notes,source:"manual",approvalStatus:status,hourlyRateSnapshot:rate,requestedAt:new Date().toISOString(),requestedBy:currentUser?.id||"__admin__",editHistory:[{at:new Date().toISOString(),by:currentUser?.id||"__admin__",action:"create_manual",note:isAdminSubmit?"Manual log added by admin":"Manual log submitted for approval"}]},...prev]);
+    setManualModal(false);
+    setManualForm({qmId:isAdmin?"":resolvedQmId,date:"",startAt:"",endAt:"",notes:""});
+  };
+
+  const auditRows=isAdmin
+    ? timeLogs.flatMap(l=>(l.editHistory||[]).map(h=>({logId:l.id,qmId:l.qmId,at:h.at,by:h.by,action:h.action,note:h.note||""}))).sort((a,b)=>new Date(b.at)-new Date(a.at))
+    : [];
+
+  const navBtn=key=>({background:"none",border:"none",color:subTab===key?"#60a5fa":"#94a3b8",borderBottom:subTab===key?"2px solid #60a5fa":"2px solid transparent",padding:"10px 14px",cursor:"pointer",fontSize:13,fontWeight:subTab===key?700:500,fontFamily:"inherit",transition:"all 0.12s",whiteSpace:"nowrap"});
+
+  if(!isAdmin&&!isScopedQM){
+    return <Card title="Time Tracker"><div style={{color:C.muted,fontSize:14,lineHeight:1.7}}>Time Tracker is available only for editor users.</div></Card>;
+  }
+
+  return(
+    <div style={{display:"flex",flexDirection:"column",gap:20}}>
+      {/* Sub-nav + timezone bar */}
+      <div style={{background:C.navy,borderRadius:12,overflow:"hidden"}}>
+        <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",padding:"0 16px",flexWrap:"wrap",gap:8}}>
+          <div style={{display:"flex"}}>
+            <button style={navBtn("log")} onClick={()=>setSubTab("log")}>⏱ Time Log</button>
+            <button style={navBtn("daily")} onClick={()=>setSubTab("daily")}>📅 Daily Log</button>
+            <button style={navBtn("settings")} onClick={()=>setSubTab("settings")}>⚙ QM Settings</button>
+          </div>
+          <div style={{display:"flex",alignItems:"center",gap:12,padding:"8px 0"}}>
+            <span style={{fontFamily:"'DM Mono',monospace",fontSize:12,color:"#94a3b8"}}>{fmtTimeTZ(now.toISOString(),viewTz)} {viewAbbr}</span>
+            <div style={{display:"flex",alignItems:"center",gap:6}}>
+              <span style={{color:"#64748b",fontSize:11,fontWeight:700,textTransform:"uppercase",letterSpacing:"0.05em"}}>View in</span>
+              <select value={viewTz} onChange={e=>setViewTz(e.target.value)} style={{background:"#0f172a",color:"#e2e8f0",border:"1px solid #334155",borderRadius:7,padding:"5px 10px",fontSize:12,cursor:"pointer",fontFamily:"inherit"}}>
+                {TZ_OPTIONS.map(t=><option key={t.iana} value={t.iana}>{t.label}</option>)}
+              </select>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {/* ── TIME LOG ──────────────────────────────────────────────────────── */}
+      {subTab==="log"&&(
+        <div style={{display:"flex",flexDirection:"column",gap:16}}>
+          <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:14}}>
+            <KPI label="Approved Time This Week" value={myHours>0?msToDur(myHours):"0h"} color={C.blue} icon="⏱"/>
+            <KPI label="Approved Pay This Week" value={fmtU(myPayWeek)} color={C.green} icon="💵"/>
+            <KPI label="Pending Time This Week" value={pendingHours>0?msToDur(pendingHours):"0h"} color={C.yellow} icon="🕒"/>
+            <KPI label="Pending Pay This Week" value={fmtU(pendingPayWeek)} color={C.orange} icon="🧾" sub={isAdmin?`${pendingLogsInScope.length} pending request(s)`:"awaiting admin approval"}/>
+          </div>
+
+          <Card title="Payments Summary">
+            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:14}}>
+              <div style={{background:C.greenSoft,border:`1px solid ${C.green}40`,borderRadius:10,padding:14}}>
+                <div style={{color:C.greenText,fontSize:11,fontWeight:700,textTransform:"uppercase",letterSpacing:"0.05em",marginBottom:6}}>Approved Payments</div>
+                <div style={{fontFamily:"'DM Mono',monospace",fontWeight:800,fontSize:24,color:C.green}}>{fmtU(approvedPayTotal)}</div>
+                <div style={{color:C.muted,fontSize:12,marginTop:4}}>{approvedLogsInScope.length} approved log(s)</div>
+              </div>
+              <div style={{background:C.yellowSoft,border:`1px solid ${C.yellow}40`,borderRadius:10,padding:14}}>
+                <div style={{color:C.yellowText,fontSize:11,fontWeight:700,textTransform:"uppercase",letterSpacing:"0.05em",marginBottom:6}}>Pending Payments</div>
+                <div style={{fontFamily:"'DM Mono',monospace",fontWeight:800,fontSize:24,color:C.orange}}>{fmtU(pendingPayTotal)}</div>
+                <div style={{color:C.muted,fontSize:12,marginTop:4}}>{pendingLogsInScope.length} pending request(s)</div>
+              </div>
+            </div>
+          </Card>
+
+          {/* Timer card — only for non-admin QMs */}
+          {!isAdmin&&(
+          <Card title="Active Timer" extra={<button onClick={()=>{setManualForm({qmId:isAdmin?"":resolvedQmId,date:today(),startAt:"09:00",endAt:"17:00",notes:""});setManualModal(true);}} style={{...btnSm,background:C.blue,color:"#fff",border:"none",fontSize:12}}>+ Add Manual Time</button>}>
+            <div style={{display:"flex",alignItems:"center",gap:20,flexWrap:"wrap"}}>
+              <div style={{fontSize:38,fontFamily:"'DM Mono',monospace",fontWeight:600,letterSpacing:3,color:timer.running?C.blue:timer.hasSession?C.yellow:C.faint,minWidth:165}}>{fmtElapsed(elapsedSec)}</div>
+              <div style={{display:"flex",gap:10,alignItems:"flex-end",flexWrap:"wrap"}}>
+                <div>
+                  <div style={{color:C.muted,fontSize:11,fontWeight:700,marginBottom:5,textTransform:"uppercase",letterSpacing:"0.05em"}}>Queue Manager</div>
+                  <select value={timer.qmId} onChange={e=>!timer.hasSession&&setTimer(t=>({...t,qmId:e.target.value}))} style={{...selStyle,width:160,opacity:timer.hasSession||!isAdmin?0.6:1,cursor:timer.hasSession||!isAdmin?"not-allowed":"pointer"}} disabled={!isAdmin}>
+                    <option value="">Select QM...</option>
+                    {qmsInScope.map(o=><option key={o.id} value={o.id}>{o.name}</option>)}
+                  </select>
+                </div>
+                <div>
+                  <div style={{color:C.muted,fontSize:11,fontWeight:700,marginBottom:5,textTransform:"uppercase",letterSpacing:"0.05em"}}>Notes</div>
+                  <input value={timer.notes} onChange={e=>setTimer(t=>({...t,notes:e.target.value}))} placeholder="Session notes..." style={{...iStyle,width:220}}/>
+                </div>
+              </div>
+              <div style={{display:"flex",gap:8,marginLeft:"auto",flexWrap:"wrap"}}>
+                {!timer.running&&<button onClick={startTimer} disabled={!timer.qmId} style={{...btnSm,background:C.blue,color:"#fff",border:"none",opacity:!timer.qmId?0.5:1}}>{timer.hasSession?"▶ Resume":"▶ Start"}</button>}
+                {timer.running&&<button onClick={pauseTimer} style={{...btnSm,background:C.yellow,color:"#fff",border:"none"}}>⏸ Pause</button>}
+                {timer.hasSession&&<button onClick={stopTimer} style={{...btnSm,background:C.red,color:"#fff",border:"none"}}>⏹ Stop & Log</button>}
+              </div>
+            </div>
+            {timer.running&&timer.sessionStartISO&&(
+              <div style={{marginTop:12,padding:"10px 14px",background:C.tealSoft,border:`1px solid ${C.teal}30`,borderRadius:8,color:C.teal,fontSize:13,lineHeight:1.5}}>
+                Started at <strong style={{fontFamily:"'DM Mono',monospace"}}>{fmtTimeTZ(timer.sessionStartISO,viewTz)} {viewAbbr}</strong> · Logging for <strong>{getQm(timer.qmId)?.name||"—"}</strong>
+              </div>
+            )}
+          </Card>
+          )}
+
+          {/* Admin gets a simple manual time add button instead of timer */}
+          {isAdmin&&(
+            <div style={{display:"flex",justifyContent:"flex-end"}}>
+              <button onClick={()=>{setManualForm({qmId:"",date:today(),startAt:"09:00",endAt:"17:00",notes:""});setManualModal(true);}} style={{...btnSm,background:C.blue,color:"#fff",border:"none"}}>+ Add Manual Time Entry</button>
+            </div>
+          )}
+
+          {/* Team clocks */}
+          {activeQMs.length>0&&(
+            <Card>
+              <div style={{display:"flex",gap:24,alignItems:"center",flexWrap:"wrap"}}>
+                <span style={{color:C.muted,fontSize:11,fontWeight:700,textTransform:"uppercase",letterSpacing:"0.07em",flexShrink:0}}>{isAdmin?"Team Now":"Your Clock"}</span>
+                {activeQMs.map(qm=>{
+                  const cfg=getQmCfg(qm.id);
+                  return(
+                    <div key={qm.id} style={{display:"flex",alignItems:"center",gap:8}}>
+                      <div style={{width:8,height:8,borderRadius:"50%",background:cfg.color,flexShrink:0}}/>
+                      <span style={{fontSize:13,color:C.muted,fontWeight:600}}>{qm.name}</span>
+                      <span style={{fontFamily:"'DM Mono',monospace",fontSize:13,fontWeight:700,color:C.text}}>{fmtTimeTZ(now.toISOString(),cfg.homeTz)}</span>
+                      <span style={{fontSize:10,color:C.faint,background:"#f1f5f9",borderRadius:4,padding:"1px 5px",fontFamily:"'DM Mono',monospace"}}>{tzAbbrFor(cfg.homeTz)}</span>
+                    </div>
+                  );
+                })}
+              </div>
+            </Card>
+          )}
+
+          {/* Log table */}
+          <Card title="Log Entries" extra={
+            <div style={{display:"flex",gap:8,alignItems:"center",flexWrap:"wrap"}}>
+              {isAdmin&&<select value={filterQm} onChange={e=>setFilterQm(e.target.value)} style={{...selStyle,width:150,fontSize:12}}>
+                <option value="all">All QMs</option>
+                {qmsInScope.map(o=><option key={o.id} value={o.id}>{o.name}</option>)}
+              </select>}
+              <span style={{color:C.faint,fontSize:11,whiteSpace:"nowrap"}}>Showing in <strong style={{color:C.muted}}>{viewAbbr}</strong></span>
+              <ExBtn onClick={()=>dlXLSX([{name:"Time Logs",data:filteredLogs.filter(l=>l.endTime).map(l=>({QM:getQmName(l.qmId),Date:fmtTZ(l.startTime,viewTz),Start:fmtTimeTZ(l.startTime,viewTz),End:fmtTimeTZ(l.endTime,viewTz),Duration:durStr(l.startTime,l.endTime),Status:logStatus(l),Notes:l.notes||"","Day Shift":hasDayShift(l.startTime,getQmCfg(l.qmId).homeTz,viewTz)?"Yes":"No"}))}],"NES_TimeLogs")} label="⬇ Export"/>
+            </div>
+          }>
+            <div style={{overflowX:"auto"}}>
+              <table style={{width:"100%",borderCollapse:"collapse",minWidth:700}}>
+                <TH cols={["QM","Date","Start","End","Duration","Status","Notes","Actions"]}/>
+                <tbody>
+                  {filteredLogs.length===0&&<tr><td colSpan={8} style={{padding:40,textAlign:"center",color:C.faint}}>No log entries yet. Start a timer above.</td></tr>}
+                  {filteredLogs.map((log,i)=>{
+                    const qm=getQm(log.qmId);
+                    const cfg=getQmCfg(log.qmId);
+                    const shift=hasDayShift(log.startTime,cfg.homeTz,viewTz);
+                    const isLive=!log.endTime;
+                    const status=logStatus(log);
+                    const ownsLog=log.qmId===myQmId||log.qmId===resolvedQmId;
+                    const canEdit=!isLive&&(isAdmin||ownsLog);
+                    const canDelete = !isLive && (isAdmin || (ownsLog && status !== "approved"));
+                    const canCancelPending=!isAdmin&&!isLive&&status==="pending"&&log.source==="manual"&&(ownsLog||log.requestedBy===currentUser?.id);
+                    return(
+                      <tr key={log.id} style={{borderTop:`1px solid ${C.border}`,background:i%2?"#fafafa":C.surface}}>
+                        <td style={{padding:"10px 14px"}}>
+                          <div style={{display:"flex",alignItems:"center",gap:8}}>
+                            <div style={{width:8,height:8,borderRadius:"50%",background:cfg.color,flexShrink:0}}/>
+                            <span style={{fontWeight:700,fontSize:13}}>{getQmName(log.qmId)}</span>
+                          </div>
+                        </td>
+                        <td style={{padding:"10px 14px"}}>
+                          <div style={{display:"flex",alignItems:"center",gap:6,flexWrap:"wrap"}}>
+                            <span style={{color:C.muted,fontSize:13}}>{fmtTZ(log.startTime,viewTz)}</span>
+                            {shift&&<span title={`${qm?.name||"QM"}'s home TZ (${tzAbbrFor(cfg.homeTz)}): ${fmtTZ(log.startTime,cfg.homeTz)} — View TZ (${viewAbbr}): ${fmtTZ(log.startTime,viewTz)}`} style={{background:C.yellowSoft,color:C.yellowText,fontSize:10,padding:"1px 6px",borderRadius:5,fontWeight:700,cursor:"help",border:`1px solid ${C.yellow}40`}}>⚠ day shift</span>}
+                          </div>
+                        </td>
+                        <td style={{padding:"10px 14px",fontFamily:"'DM Mono',monospace",fontSize:13,color:C.muted}}>{fmtTimeTZ(log.startTime,viewTz)}</td>
+                        <td style={{padding:"10px 14px",fontFamily:"'DM Mono',monospace",fontSize:13,color:C.muted}}>{isLive?<Bdg color={C.green}>Live</Bdg>:fmtTimeTZ(log.endTime,viewTz)}</td>
+                        <td style={{padding:"10px 14px",fontFamily:"'DM Mono',monospace",fontWeight:700,color:C.text}}>{isLive?fmtElapsed(elapsedSec):durStr(log.startTime,log.endTime)}</td>
+                        <td style={{padding:"10px 14px"}}><Bdg color={status==="approved"?C.green:status==="pending"?C.yellow:status==="cancelled"?C.faint:C.red}>{status.toUpperCase()}</Bdg></td>
+                        <td style={{padding:"10px 14px",color:C.muted,fontSize:13,maxWidth:180}}>{log.notes||"—"}</td>
+                        <td style={{padding:"10px 14px"}}>
+                          <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>
+                            {canEdit&&<button onClick={()=>openEditLog(log)} style={{...btnSm,padding:"3px 10px",fontSize:12}}>Edit</button>}
+                            {canDelete&&<button onClick={()=>setTimeLogs(prev=>prev.filter(l=>l.id!==log.id))} style={{...btnSm,padding:"3px 10px",fontSize:12,color:C.red,borderColor:C.red+"40"}}>Delete</button>}
+                            {isAdmin&&status==="pending"&&<>
+                              <button onClick={()=>approveManual(log.id)} style={{...btnSm,padding:"3px 10px",fontSize:12,background:C.green,color:"#fff",border:"none"}}>Approve</button>
+                              <button onClick={()=>{setRejectLogId(log.id);setRejectReason("");setRejectModal(true);}} style={{...btnSm,padding:"3px 10px",fontSize:12,background:C.red,color:"#fff",border:"none"}}>Reject</button>
+                            </>}
+                            {canCancelPending&&<button onClick={()=>cancelManualRequest(log.id)} style={{...btnSm,padding:"3px 10px",fontSize:12,background:C.faint,color:"#fff",border:"none"}}>Cancel Request</button>}
+                          </div>
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          </Card>
+
+          {isAdmin&&(
+            <Card title="Edit Audit Log">
+              <div style={{overflowX:"auto"}}>
+                <table style={{width:"100%",borderCollapse:"collapse",minWidth:700}}>
+                  <TH cols={["When","QM","Action","By","Note","Log ID"]}/>
+                  <tbody>
+                    {auditRows.length===0&&<tr><td colSpan={6} style={{padding:30,textAlign:"center",color:C.faint}}>No edit activity yet.</td></tr>}
+                    {auditRows.slice(0,100).map((a,i)=>(
+                      <tr key={a.logId+a.at+i} style={{borderTop:`1px solid ${C.border}`,background:i%2?"#fafafa":C.surface}}>
+                        <td style={{padding:"10px 14px",fontFamily:"'DM Mono',monospace",fontSize:12,color:C.muted}}>{fmtTZ(a.at,viewTz)} {fmtTimeTZ(a.at,viewTz)}</td>
+                        <td style={{padding:"10px 14px",fontWeight:700,fontSize:13}}>{getQmName(a.qmId)}</td>
+                        <td style={{padding:"10px 14px"}}><Bdg color={C.blue}>{a.action}</Bdg></td>
+                        <td style={{padding:"10px 14px",fontFamily:"'DM Mono',monospace",fontSize:12,color:C.muted}}>{a.by}</td>
+                        <td style={{padding:"10px 14px",fontSize:13,color:C.muted}}>{a.note||"—"}</td>
+                        <td style={{padding:"10px 14px",fontFamily:"'DM Mono',monospace",fontSize:12,color:C.faint}}>{a.logId}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </Card>
+          )}
+        </div>
+      )}
+
+      {/* ── DAILY LOG ─────────────────────────────────────────────────────── */}
+      {subTab==="daily"&&(
+        <div style={{display:"flex",flexDirection:"column",gap:16}}>
+          <Card title={`Daily Hours · Week of ${weekDays[0].toLocaleDateString("en-GB",{day:"numeric",month:"short"})} – ${weekDays[6].toLocaleDateString("en-GB",{day:"numeric",month:"short"})}`} extra={<div style={{display:"flex",gap:8,alignItems:"center",flexWrap:"wrap"}}>
+            {isAdmin&&<select value={filterQm} onChange={e=>setFilterQm(e.target.value)} style={{...selStyle,width:150,fontSize:12}}>
+              <option value="all">All QMs</option>
+              {opsTeam.map(o=><option key={o.id} value={o.id}>{o.name}</option>)}
+            </select>}
+            <ExBtn onClick={()=>{
+              const scoped=(isAdmin&&filterQm!=="all")?logsInScope.filter(l=>l.qmId===filterQm):logsInScope;
+              const rows=weekDays.map(d=>{
+                const ds=isoDateInTZ(d.toISOString(),viewTz);
+                const dayLogs=scoped.filter(l=>l.endTime&&isoDateInTZ(l.startTime,viewTz)===ds);
+                const approvedMs=dayLogs.filter(l=>logStatus(l)==="approved").reduce((s,l)=>s+msClippedToDay(l,d,viewTz),0);
+                const pendingMs=dayLogs.filter(l=>logStatus(l)==="pending").reduce((s,l)=>s+msClippedToDay(l,d,viewTz),0);
+                return {Day:d.toLocaleDateString("en-GB",{weekday:"short"}),Date:d.toLocaleDateString("en-GB",{day:"2-digit",month:"short"}),"Approved Hrs":+(approvedMs/3600000).toFixed(2),"Pending Hrs":+(pendingMs/3600000).toFixed(2),"Total Hrs":+((approvedMs+pendingMs)/3600000).toFixed(2),Entries:dayLogs.length};
+              });
+              dlXLSX([{name:"Daily Hours",data:rows}],"NES_Daily_Time_Log");
+            }} label="⬇ Export"/>
+          </div>}>
+            <div style={{overflowX:"auto"}}>
+              <table style={{width:"100%",borderCollapse:"collapse",minWidth:700}}>
+                <TH cols={["Day","Date","Approved Hours","Pending Hours","Total Hours","Entries"]}/>
+                <tbody>
+                  {weekDays.map((day,i)=>{
+                    const ds=isoDateInTZ(day.toISOString(),viewTz);
+                    const scoped=(isAdmin&&filterQm!=="all")?logsInScope.filter(l=>l.qmId===filterQm):logsInScope;
+                    const dayLogs=scoped.filter(l=>l.endTime&&isoDateInTZ(l.startTime,viewTz)===ds);
+                    const approvedMs=dayLogs.filter(l=>logStatus(l)==="approved").reduce((s,l)=>s+msClippedToDay(l,day,viewTz),0);
+                    const pendingMs=dayLogs.filter(l=>logStatus(l)==="pending").reduce((s,l)=>s+msClippedToDay(l,day,viewTz),0);
+                    const totalMs=approvedMs+pendingMs;
+                    const isToday=isoDateInTZ(now.toISOString(),viewTz)===ds;
+                    const hasCrossMidnight=dayLogs.some(l=>l.endTime&&isoDateInTZ(l.endTime,viewTz)!==isoDateInTZ(l.startTime,viewTz));
+                    return(
+                      <tr key={ds} style={{borderTop:`1px solid ${C.border}`,background:isToday?C.blueSoft:(i%2?"#fafafa":C.surface)}}>
+                        <td style={{padding:"10px 14px",fontWeight:700}}>{day.toLocaleDateString("en-GB",{weekday:"short"})}</td>
+                        <td style={{padding:"10px 14px",color:C.muted,fontSize:13}}>{day.toLocaleDateString("en-GB",{day:"2-digit",month:"short"})}</td>
+                        <td style={{padding:"10px 14px",fontFamily:"'DM Mono',monospace",color:C.green}}>{(approvedMs/3600000).toFixed(2)}h</td>
+                        <td style={{padding:"10px 14px",fontFamily:"'DM Mono',monospace",color:C.yellowText}}>{(pendingMs/3600000).toFixed(2)}h</td>
+                        <td style={{padding:"10px 14px",fontFamily:"'DM Mono',monospace",fontWeight:700,color:C.text}}>{(totalMs/3600000).toFixed(2)}h</td>
+                        <td style={{padding:"10px 14px",fontFamily:"'DM Mono',monospace",color:C.muted}}>
+                          <span>{dayLogs.length}</span>
+                          {hasCrossMidnight&&<span style={{marginLeft:8}}><Bdg color={C.yellow}>⚠ cross-midnight</Bdg></span>}
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+            <div style={{marginTop:10,fontSize:11,color:C.faint}}>Hours are clipped to each calendar day boundary in {viewAbbr}. Cross-midnight logs are split across days and flagged with ⚠.</div>
+          </Card>
+        </div>
+      )}
+
+      {/* ── QM SETTINGS ───────────────────────────────────────────────────── */}
+      {subTab==="settings"&&(
+        <div style={{display:"flex",flexDirection:"column",gap:12}}>
+          {qmsInScope.length===0&&<div style={{color:C.faint,textAlign:"center",padding:40,background:C.surface,border:`1px solid ${C.border}`,borderRadius:12}}>No mapped Ops Team member found for this account.</div>}
+          {qmsInScope.map(qm=>{
+            const cfg=getQmCfg(qm.id);
+            const isOpen=colorPickerFor===qm.id;
+            return(
+              <div key={qm.id} style={{background:C.surface,border:`1px solid ${C.border}`,borderRadius:12,padding:"14px 20px",display:"flex",alignItems:"center",gap:16,flexWrap:"wrap"}}>
+                <div style={{position:"relative",flexShrink:0}}>
+                  <div onClick={()=>setColorPickerFor(isOpen?null:qm.id)} title="Click to change colour" style={{width:28,height:28,borderRadius:8,background:cfg.color,cursor:"pointer",border:"2px solid #fff",boxShadow:`0 0 0 1px ${C.border}`}}/>
+                  {isOpen&&(
+                    <div style={{position:"absolute",top:36,left:0,background:C.surface,border:`1px solid ${C.border}`,borderRadius:10,padding:10,display:"grid",gridTemplateColumns:"repeat(5,1fr)",gap:6,zIndex:200,boxShadow:"0 8px 24px #0002"}}>
+                      {QM_COLORS.map(c=><div key={c} onClick={()=>{updateQmCfg(qm.id,{color:c});setColorPickerFor(null);}} style={{width:22,height:22,borderRadius:6,background:c,cursor:"pointer",border:cfg.color===c?`2px solid ${C.text}`:"2px solid transparent",boxSizing:"border-box"}}/>)}
+                    </div>
+                  )}
+                </div>
+                <div style={{flex:1,minWidth:100}}>
+                  <div style={{fontWeight:700,fontSize:14}}>{qm.name}</div>
+                  <div style={{color:C.muted,fontSize:12,marginTop:2}}>{qm.role||"Ops"} · {qm.region||"—"}</div>
+                </div>
+                <div>
+                  <div style={{color:C.muted,fontSize:11,fontWeight:700,marginBottom:5,textTransform:"uppercase",letterSpacing:"0.05em"}}>Home Timezone</div>
+                  <select value={cfg.homeTz} onChange={e=>updateQmCfg(qm.id,{homeTz:e.target.value})} style={{...selStyle,width:185,fontSize:13}}>
+                    {TZ_OPTIONS.map(t=><option key={t.iana} value={t.iana}>{t.label}</option>)}
+                  </select>
+                </div>
+                <div style={{textAlign:"center"}}>
+                  <div style={{color:C.muted,fontSize:11,fontWeight:700,marginBottom:5,textTransform:"uppercase",letterSpacing:"0.05em"}}>Status</div>
+                  <Bdg color={STATUS_COLOR_MAP[qm.status]||C.faint}>{qm.status||"—"}</Bdg>
+                </div>
+              </div>
+            );
+          })}
+          <div style={{padding:"12px 16px",background:C.tealSoft,border:`1px solid ${C.teal}30`,borderRadius:10}}>
+            <div style={{color:C.teal,fontSize:13,lineHeight:1.7}}><strong>Day shift badge:</strong> The ⚠ badge in the Time Log flags entries where the calendar date differs between a QM's home timezone and the current view timezone — e.g. your Monday 00:00 BST appears as Sunday 19:00 EST. Hover the badge in the log to see both dates side by side.</div>
+          </div>
+        </div>
+      )}
+
+      {/* Add Event Modal */}
+      {addEventModal&&(
+        <Modal title="Add Availability Event" onClose={()=>setAddEventModal(false)}>
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:14}}>
+            <FF label="Queue Manager">
+              <select value={eventForm.qmId} onChange={e=>setEventForm(p=>({...p,qmId:e.target.value}))} style={selStyle}>
+                {isAdmin&&<option value="all">All team</option>}
+                {activeQMs.map(o=><option key={o.id} value={o.id}>{o.name}</option>)}
+              </select>
+            </FF>
+            <FF label="Type">
+              <select value={eventForm.type} onChange={e=>setEventForm(p=>({...p,type:e.target.value}))} style={selStyle}>
+                <option value="available">Available</option>
+                <option value="deadline">Deadline</option>
+                <option value="ooo">Out of Office</option>
+              </select>
+            </FF>
+            <FF label="Label (optional)"><input type="text" value={eventForm.label} onChange={e=>setEventForm(p=>({...p,label:e.target.value}))} placeholder={eventForm.type==="deadline"?"e.g. Batch 4 deadline":"e.g. Available for tasks"} style={iStyle}/></FF>
+            <FF label="Start Time"><input type="datetime-local" value={eventForm.startTime} onChange={e=>setEventForm(p=>({...p,startTime:e.target.value}))} style={iStyle}/></FF>
+            {eventForm.type!=="deadline"&&<FF label="End Time"><input type="datetime-local" value={eventForm.endTime} onChange={e=>setEventForm(p=>({...p,endTime:e.target.value}))} style={iStyle}/></FF>}
+          </div>
+          <button onClick={()=>{
+            if(!eventForm.startTime)return;
+            const si=new Date(eventForm.startTime).toISOString();
+            const ei=eventForm.type==="deadline"?si:(eventForm.endTime?new Date(eventForm.endTime).toISOString():si);
+            setAvailEvents(prev=>[...prev,{id:"AV"+Date.now(),qmId:eventForm.qmId||(isAdmin?"all":myQmId),type:eventForm.type,startTime:si,endTime:ei,label:eventForm.label}]);
+            setAddEventModal(false);
+          }} style={btnPri}>Add Event</button>
+        </Modal>
+      )}
+
+      {manualModal&&(
+        <Modal title="Add Manual Time" onClose={()=>setManualModal(false)}>
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:14}}>
+            <FF label="Queue Manager">
+              <select value={manualForm.qmId} onChange={e=>setManualForm(p=>({...p,qmId:e.target.value}))} style={{...selStyle,opacity:isAdmin?1:0.65,cursor:isAdmin?"pointer":"not-allowed"}} disabled={!isAdmin}>
+                <option value="">Select QM...</option>
+                {qmsInScope.map(o=><option key={o.id} value={o.id}>{o.name}</option>)}
+              </select>
+            </FF>
+            <FF label="Date"><input type="date" value={manualForm.date} onChange={e=>setManualForm(p=>({...p,date:e.target.value}))} style={iStyle}/></FF>
+            <FF label="Start Time"><input type="time" step="900" value={manualForm.startAt} onChange={e=>setManualForm(p=>({...p,startAt:e.target.value}))} style={iStyle}/></FF>
+            <FF label="End Time"><input type="time" step="900" value={manualForm.endAt} onChange={e=>setManualForm(p=>({...p,endAt:e.target.value}))} style={iStyle}/></FF>
+            <FF label="Session Notes (required — describe what you worked on)"><input type="text" value={manualForm.notes} onChange={e=>setManualForm(p=>({...p,notes:e.target.value}))} style={{...iStyle,borderColor:!manualForm.notes?.trim()?C.red:C.border}} placeholder="e.g. Reviewed 45 tasks, onboarding call with new annotators..."/></FF>
+          </div>
+          <div style={{marginBottom:12,padding:"10px 12px",background:C.blueSoft,border:`1px solid ${C.blue}30`,borderRadius:8,color:C.blueText,fontSize:12}}>Time inputs are interpreted in {viewAbbr}.</div>
+          {!isAdmin&&<div style={{marginBottom:12,padding:"10px 12px",background:C.yellowSoft,border:`1px solid ${C.yellow}40`,borderRadius:8,color:C.yellowText,fontSize:12}}>Manual time is submitted as pending and requires admin approval before it appears in approved pay.</div>}
+          <button onClick={submitManualTime} style={btnPri}>{isAdmin?"Add Approved Log":"Submit for Approval"}</button>
+        </Modal>
+      )}
+
+      {editModal&&(
+        <Modal title="Edit Time Log" onClose={()=>setEditModal(false)}>
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:14}}>
+            <FF label="Queue Manager">
+              <select value={editForm.qmId} onChange={e=>setEditForm(p=>({...p,qmId:e.target.value}))} style={{...selStyle,opacity:isAdmin?1:0.65,cursor:isAdmin?"pointer":"not-allowed"}} disabled={!isAdmin}>
+                {qmsInScope.map(o=><option key={o.id} value={o.id}>{o.name}</option>)}
+              </select>
+            </FF>
+            <FF label="Start Time"><input type="datetime-local" value={editForm.startTime} onChange={e=>setEditForm(p=>({...p,startTime:e.target.value}))} style={iStyle}/></FF>
+            <FF label="End Time"><input type="datetime-local" value={editForm.endTime} onChange={e=>setEditForm(p=>({...p,endTime:e.target.value}))} style={iStyle}/></FF>
+            <FF label="Notes"><input type="text" value={editForm.notes} onChange={e=>setEditForm(p=>({...p,notes:e.target.value}))} style={iStyle}/></FF>
+          </div>
+          {!isAdmin&&<div style={{marginBottom:12,padding:"10px 12px",background:C.yellowSoft,border:`1px solid ${C.yellow}40`,borderRadius:8,color:C.yellowText,fontSize:12}}>Edits to approved logs move them back to pending for admin review.</div>}
+          <button onClick={saveEditedLog} style={btnPri}>Save Changes</button>
+        </Modal>
+      )}
+
+      {rejectModal&&(
+        <Modal title="Reject Manual Time" onClose={()=>setRejectModal(false)} width={480}>
+          <FF label="Reason (optional)">
+            <textarea value={rejectReason} onChange={e=>setRejectReason(e.target.value)} rows={4} style={{...iStyle,resize:"vertical"}} placeholder="Add a reason visible in log history"/>
+          </FF>
+          <button onClick={rejectManual} style={{...btnPri,background:C.red}}>Reject Request</button>
+        </Modal>
+      )}
+    </div>
+  );
+}
+
 // ─── APP ROOT ────────────────────────────────────────────────────────────────
 export default function App(){
   const [userId,setUserId]=useState(null);
@@ -1571,8 +2372,11 @@ export default function App(){
   const [taskTracker,setTaskTracker,l7]=useSupabase("task_tracker",[]);
   const [rampData,setRampData,l8]=useSupabase("ramp_data",RAMP_DEFAULT);
   const [accessUsers,setAccessUsers,l9]=useSupabase("access_users",[]);
+  const [timeLogs,setTimeLogs,l10]=useSupabase("time_logs",[]);
+  const [qmSettings,setQmSettings,l11]=useSupabase("qm_settings",[]);
+  const [availEvents,setAvailEvents,l12]=useSupabase("availability_events",[]);
 
-  const allLoaded=l1&&l2&&l3&&l4&&l5&&l6&&l7&&l8&&l9;
+  const allLoaded=l1&&l2&&l3&&l4&&l5&&l6&&l7&&l8&&l9&&l10&&l11&&l12;
 
   const isAdmin=userId==="__admin__";
   const currentUser=accessUsers.find(u=>u.id===userId);
@@ -1584,6 +2388,7 @@ export default function App(){
     setExperts([]);setReviewers([]);setOpsTeam([]);setTickets([]);
     setFinancials(DEFAULT_FIN);setPhaseFinancials({});setTaskTracker([]);
     setRampData(RAMP_DEFAULT);setAccessUsers([]);
+    setTimeLogs([]);setQmSettings([]);setAvailEvents([]);
   }};
 
   if(!allLoaded) return(
@@ -1605,44 +2410,63 @@ export default function App(){
     Standup:<StandupTab experts={experts} reviewers={reviewers} opsTeam={opsTeam} tickets={tickets} taskTracker={taskTracker} financials={financials}/>,
     Experts:<PersonTab items={experts} setItems={setExperts} type="expert" financials={financials}/>,
     Reviewers:<PersonTab items={reviewers} setItems={setReviewers} type="reviewer" financials={financials}/>,
-    "Ops Team":<PersonTab items={opsTeam} setItems={setOpsTeam} type="ops" financials={financials}/>,
+    "Ops Team":<PersonTab items={opsTeam} setItems={setOpsTeam} type="ops" financials={financials} timeLogs={timeLogs}/>,
     Tickets:<TicketsTab tickets={tickets} setTickets={setTickets} experts={experts} reviewers={reviewers} opsTeam={opsTeam}/>,
     Tasks:<TasksTab taskTracker={taskTracker} setTaskTracker={setTaskTracker}/>,
     Velocity:<VelocityTab taskTracker={taskTracker} rampData={rampData}/>,
     "Quality Control":<QualityTab experts={experts} reviewers={reviewers} financials={financials}/>,
     "Ramp Plan":<RampPlanTab rampData={rampData} setRampData={setRampData}/>,
-    Financials:<FinancialsTab experts={experts} reviewers={reviewers} opsTeam={opsTeam} financials={financials} setFinancials={setFinancials} phaseFinancials={phaseFinancials} setPhaseFinancials={setPhaseFinancials} taskTracker={taskTracker}/>,
-    Visualizations:<VisualizationsTab experts={experts} reviewers={reviewers} tickets={tickets} financials={financials} taskTracker={taskTracker} opsTeam={opsTeam}/>,
-    Risk:<RiskTab experts={experts} reviewers={reviewers} tickets={tickets} financials={financials} opsTeam={opsTeam} taskTracker={taskTracker} rampData={rampData} phaseFinancials={phaseFinancials}/>,
+    Financials:<FinancialsTab experts={experts} reviewers={reviewers} opsTeam={opsTeam} timeLogs={timeLogs} financials={financials} setFinancials={setFinancials} phaseFinancials={phaseFinancials} setPhaseFinancials={setPhaseFinancials} taskTracker={taskTracker}/>,
+    Visualizations:<VisualizationsTab experts={experts} reviewers={reviewers} tickets={tickets} financials={financials} taskTracker={taskTracker} opsTeam={opsTeam} timeLogs={timeLogs}/>,
+    Risk:<RiskTab experts={experts} reviewers={reviewers} tickets={tickets} financials={financials} opsTeam={opsTeam} timeLogs={timeLogs} taskTracker={taskTracker} rampData={rampData} phaseFinancials={phaseFinancials}/>,
+    "Time Tracker":<TimeTrackerTab timeLogs={timeLogs} setTimeLogs={setTimeLogs} qmSettings={qmSettings} setQmSettings={setQmSettings} availEvents={availEvents} setAvailEvents={setAvailEvents} opsTeam={opsTeam} accessUsers={accessUsers} currentUser={currentUser} isAdmin={isAdmin}/>,
     Access:<AccessTab accessUsers={accessUsers} setAccessUsers={setAccessUsers}/>,
   };
 
   return(
     <div style={{minHeight:"100vh",width:"100%",background:C.bg,color:C.text,fontFamily:"'IBM Plex Sans','Segoe UI',system-ui,sans-serif"}}>
       <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700;800&family=DM+Mono:wght@400;500&display=swap" rel="stylesheet"/>
+      <style>{`
+        *{box-sizing:border-box;}
+        @media(max-width:768px){
+          .kpi-grid{grid-template-columns:repeat(2,1fr)!important;}
+          .kpi-grid-4{grid-template-columns:repeat(2,1fr)!important;}
+          .hide-mobile{display:none!important;}
+          .modal-inner{padding:20px!important;width:96vw!important;}
+          .card-pad{padding:14px!important;}
+          .tab-content{padding:14px 12px!important;}
+          .header-stats{display:none!important;}
+          table{font-size:12px!important;}
+          td,th{padding:7px 8px!important;}
+        }
+        @media(max-width:480px){
+          .kpi-grid{grid-template-columns:1fr 1fr!important;}
+          .kpi-grid-4{grid-template-columns:1fr 1fr!important;}
+        }
+      `}</style>
       <div style={{background:C.navy,borderBottom:"1px solid #1e40af",position:"sticky",top:0,zIndex:100,width:"100%"}}>
-        <div style={{padding:"0 24px",display:"flex",alignItems:"center",justifyContent:"space-between",height:56}}>
-          <div style={{display:"flex",alignItems:"center",gap:12}}>
-            <div style={{width:8,height:8,borderRadius:"50%",background:"#4ade80",boxShadow:"0 0 8px #4ade80"}}/>
-            <span style={{fontWeight:800,fontSize:15,color:"#f1f5f9"}}>GitHub NES Ops Center</span>
-            {isAdmin&&<span style={{background:"#dc262620",color:"#fca5a5",borderRadius:6,padding:"2px 10px",fontSize:12,fontWeight:700}}>ADMIN</span>}
-            {!isAdmin&&currentUser&&<span style={{background:"#ffffff20",color:"#94a3b8",borderRadius:6,padding:"2px 10px",fontSize:12}}>{currentUser.name} · {currentUser.role}</span>}
+        <div style={{padding:"0 16px",display:"flex",alignItems:"center",justifyContent:"space-between",height:52}}>
+          <div style={{display:"flex",alignItems:"center",gap:10}}>
+            <div style={{width:8,height:8,borderRadius:"50%",background:"#4ade80",boxShadow:"0 0 8px #4ade80",flexShrink:0}}/>
+            <span style={{fontWeight:800,fontSize:14,color:"#f1f5f9",whiteSpace:"nowrap"}}>NES Ops Center</span>
+            {isAdmin&&<span style={{background:"#dc262620",color:"#fca5a5",borderRadius:6,padding:"2px 8px",fontSize:11,fontWeight:700,flexShrink:0}}>ADMIN</span>}
+            {!isAdmin&&currentUser&&<span style={{background:"#ffffff20",color:"#94a3b8",borderRadius:6,padding:"2px 8px",fontSize:11,flexShrink:0,maxWidth:120,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{currentUser.name}</span>}
           </div>
-          <div style={{display:"flex",gap:10,alignItems:"center"}}>
-            <span style={{color:"#94a3b8",fontSize:12,fontFamily:"'DM Mono',monospace"}}>{experts.filter(e=>e.status==="active").length}E · {reviewers.filter(r=>r.status==="active").length}R · {tickets.filter(t=>t.status!=="COMPLETED").length} open</span>
-            {isAdmin&&<button onClick={resetAll} style={{background:"transparent",border:"1px solid #334155",borderRadius:7,color:"#94a3b8",padding:"4px 12px",cursor:"pointer",fontSize:12}}>Reset All</button>}
-            <button onClick={()=>setUserId(null)} style={{background:"transparent",border:"1px solid #334155",borderRadius:7,color:"#94a3b8",padding:"4px 12px",cursor:"pointer",fontSize:12}}>Log Out</button>
+          <div style={{display:"flex",gap:8,alignItems:"center"}}>
+            <span className="header-stats" style={{color:"#94a3b8",fontSize:12,fontFamily:"'DM Mono',monospace"}}>{experts.filter(e=>e.status==="active").length}E · {reviewers.filter(r=>r.status==="active").length}R · {tickets.filter(t=>t.status!=="COMPLETED").length} open</span>
+            {isAdmin&&<button onClick={resetAll} style={{background:"transparent",border:"1px solid #334155",borderRadius:7,color:"#94a3b8",padding:"4px 10px",cursor:"pointer",fontSize:11}}>Reset</button>}
+            <button onClick={()=>setUserId(null)} style={{background:"transparent",border:"1px solid #334155",borderRadius:7,color:"#94a3b8",padding:"4px 10px",cursor:"pointer",fontSize:11}}>Log Out</button>
           </div>
         </div>
-        <div style={{padding:"0 24px",display:"flex",gap:0,overflowX:"auto",width:"100%",boxSizing:"border-box"}}>
+        <div style={{padding:"0 16px",display:"flex",gap:0,overflowX:"auto",width:"100%",boxSizing:"border-box",WebkitOverflowScrolling:"touch"}}>
           {visibleTabs.map(tab=>(
-            <button key={tab} onClick={()=>setActiveTab(tab)} style={{background:"none",border:"none",color:activeTab===tab?"#60a5fa":"#94a3b8",padding:"10px 14px",cursor:"pointer",fontSize:13,fontWeight:activeTab===tab?700:500,borderBottom:activeTab===tab?"2px solid #60a5fa":"2px solid transparent",transition:"all 0.12s",whiteSpace:"nowrap"}}>
+            <button key={tab} onClick={()=>setActiveTab(tab)} style={{background:"none",border:"none",color:activeTab===tab?"#60a5fa":"#94a3b8",padding:"9px 12px",cursor:"pointer",fontSize:12,fontWeight:activeTab===tab?700:500,borderBottom:activeTab===tab?"2px solid #60a5fa":"2px solid transparent",transition:"all 0.12s",whiteSpace:"nowrap",fontFamily:"inherit"}}>
               {tab}
             </button>
           ))}
         </div>
       </div>
-      <div style={{padding:"28px 24px",width:"100%",boxSizing:"border-box"}}>
+      <div className="tab-content" style={{padding:"20px 16px",width:"100%",boxSizing:"border-box"}}>
         {tabContent[activeTab]||<div style={{color:C.muted,textAlign:"center",padding:60}}>Access denied.</div>}
       </div>
     </div>
