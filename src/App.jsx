@@ -1814,33 +1814,57 @@ function TimeTrackerTab({timeLogs,setTimeLogs,qmSettings,setQmSettings,availEven
     if(!timer.hasSession){
       const newId="TL"+Date.now();
       const rate=(getQm(timer.qmId)?.hourlyRate||0);
-      setTimeLogs(prev=>[{id:newId,qmId:timer.qmId,startTime:nowISO,endTime:null,notes:timer.notes,source:"timer",approvalStatus:"approved",hourlyRateSnapshot:rate,lockedBy:TAB_ID},...prev]);
+      setTimeLogs(prev=>[{id:newId,qmId:timer.qmId,startTime:nowISO,endTime:null,notes:timer.notes,source:"timer",approvalStatus:"pending",hourlyRateSnapshot:rate,lockedBy:TAB_ID},...prev]);
       setTimer(t=>({...t,running:true,hasSession:true,sessionStartISO:nowISO,adjustedStartISO:nowISO,pausedElapsedMs:0,activeLogId:newId}));
     } else {
-      // Resume: shift adjustedStartISO so elapsed continues from where it paused
       const resumed=new Date(Date.now()-timer.pausedElapsedMs).toISOString();
       setTimer(t=>({...t,running:true,adjustedStartISO:resumed}));
     }
   };
   const pauseTimer=()=>{
-    const activeLog = timeLogs.find(l => l.id === timer.activeLogId);
-    if (activeLog && activeLog.lockedBy && activeLog.lockedBy !== TAB_ID) {
-      alert("This session is active in another tab. Please use that tab to control the timer.");
-      return;
-    }
+    const activeLog=timeLogs.find(l=>l.id===timer.activeLogId);
+    if(activeLog&&activeLog.lockedBy&&activeLog.lockedBy!==TAB_ID){alert("This session is active in another tab.");return;}
     const elapsed=Math.max(0,now.getTime()-new Date(timer.adjustedStartISO).getTime());
     setTimer(t=>({...t,running:false,pausedElapsedMs:elapsed}));
   };
   const stopTimer=()=>{
-    const activeLog = timeLogs.find(l => l.id === timer.activeLogId);
-    if (activeLog && activeLog.lockedBy && activeLog.lockedBy !== TAB_ID) {
-      alert("This session is active in another tab. Please use that tab to control the timer.");
-      return;
-    }
+    const activeLog=timeLogs.find(l=>l.id===timer.activeLogId);
+    if(activeLog&&activeLog.lockedBy&&activeLog.lockedBy!==TAB_ID){alert("This session is active in another tab.");return;}
+    if(!timer.notes||!timer.notes.trim()){alert("Please add session notes describing what you worked on before stopping.");return;}
     const endTime=new Date().toISOString();
-    setTimeLogs(prev=>prev.map(l=>l.id===timer.activeLogId?{...l,endTime,notes:timer.notes,approvalStatus:logStatus(l),editHistory:pushHistory(l,"timer_stop","Timer session completed")} :l));
+    setTimeLogs(prev=>prev.map(l=>l.id===timer.activeLogId?{...l,endTime,notes:timer.notes,approvalStatus:"pending",editHistory:pushHistory(l,"timer_stop","Timer session completed — pending admin approval")}:l));
     setTimer({running:false,hasSession:false,sessionStartISO:null,adjustedStartISO:null,pausedElapsedMs:0,qmId:timer.qmId,notes:"",activeLogId:null});
   };
+
+  // Admin force-stop: stop any active log regardless of lockedBy
+  const adminForceStop=(logId)=>{
+    if(!confirm("Force-stop this active timer? The log will be closed at the current time and marked pending approval.")) return;
+    const endTime=new Date().toISOString();
+    setTimeLogs(prev=>prev.map(l=>l.id===logId?{...l,endTime,approvalStatus:"pending",editHistory:pushHistory(l,"admin_force_stop","Admin force-stopped active timer")}:l));
+  };
+
+  // Auto-stop on tab close via beforeunload + visibility change
+  useEffect(()=>{
+    const handleUnload=()=>{
+      if(timer.running&&timer.activeLogId){
+        const endTime=new Date().toISOString();
+        // Use navigator.sendBeacon for reliable unload — but since we use Supabase
+        // we update via the sync fn directly; this fires before unload completes
+        setTimeLogs(prev=>prev.map(l=>l.id===timer.activeLogId?{...l,endTime,approvalStatus:"pending",editHistory:[...(l.editHistory||[]),{at:endTime,by:"system",action:"auto_stop",note:"Timer auto-stopped: tab closed"}]}:l));
+      }
+    };
+    const handleVisibility=()=>{
+      if(document.visibilityState==="hidden"&&timer.running&&timer.activeLogId){
+        // Mark in Supabase that this session should be considered stopped
+        // We don't stop immediately on hide (user may switch tabs briefly)
+        // but we update the log's lastSeen time
+        sbSet("time_logs",timeLogs.map(l=>l.id===timer.activeLogId?{...l,lastSeen:new Date().toISOString()}:l));
+      }
+    };
+    window.addEventListener("beforeunload",handleUnload);
+    document.addEventListener("visibilitychange",handleVisibility);
+    return()=>{window.removeEventListener("beforeunload",handleUnload);document.removeEventListener("visibilitychange",handleVisibility);};
+  },[timer.running,timer.activeLogId,timer.notes]);
 
   const updateQmCfg=(qmId,patch)=>setQmSettings(prev=>{
     const exists=prev.find(s=>s.qmId===qmId);
@@ -2093,6 +2117,59 @@ function TimeTrackerTab({timeLogs,setTimeLogs,qmSettings,setQmSettings,availEven
               </div>
             </Card>
           )}
+
+          {/* Pending Approvals — admin sees all, QM sees their own */}
+          {(()=>{
+            const pending=filteredLogs.filter(l=>l.endTime&&logStatus(l)==="pending");
+            const activeLogs=filteredLogs.filter(l=>!l.endTime);
+            if(!pending.length&&!activeLogs.length) return null;
+            return(
+              <div style={{display:"flex",flexDirection:"column",gap:10}}>
+                {activeLogs.length>0&&(
+                  <Card title="🔴 Active Timers" color={C.red+"40"}>
+                    <div style={{display:"flex",flexDirection:"column",gap:8}}>
+                      {activeLogs.map(log=>(
+                        <div key={log.id} style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"12px 16px",background:C.redSoft,borderRadius:8,flexWrap:"wrap",gap:8}}>
+                          <div>
+                            <div style={{fontWeight:700}}>{getQmName(log.qmId)}</div>
+                            <div style={{color:C.muted,fontSize:12}}>Started: {fmtTimeTZ(log.startTime,viewTz)} {viewAbbr} · Running for {durStr(log.startTime,now.toISOString())}</div>
+                            {log.notes&&<div style={{color:C.muted,fontSize:12,marginTop:2}}>📝 {log.notes}</div>}
+                          </div>
+                          <div style={{display:"flex",gap:8}}>
+                            <Bdg color={C.red}>LIVE</Bdg>
+                            {isAdmin&&<button onClick={()=>adminForceStop(log.id)} style={{...btnSm,background:C.red,color:"#fff",border:"none",fontSize:12}}>⏹ Force Stop</button>}
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </Card>
+                )}
+                {pending.length>0&&(
+                  <Card title={`⏳ Pending Approvals (${pending.length})`} color={C.yellow+"60"}>
+                    <div style={{display:"flex",flexDirection:"column",gap:8}}>
+                      {pending.map(log=>(
+                        <div key={log.id} style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"12px 16px",background:C.yellowSoft,borderRadius:8,flexWrap:"wrap",gap:8}}>
+                          <div style={{flex:1,minWidth:0}}>
+                            <div style={{fontWeight:700}}>{getQmName(log.qmId)}</div>
+                            <div style={{color:C.muted,fontSize:12}}>{fmtTZ(log.startTime,viewTz)} · {fmtTimeTZ(log.startTime,viewTz)}–{fmtTimeTZ(log.endTime,viewTz)} {viewAbbr} · <strong>{durStr(log.startTime,log.endTime)}</strong></div>
+                            {log.notes&&<div style={{color:C.text,fontSize:13,marginTop:4,padding:"6px 10px",background:"#fff8",borderRadius:6}}>📝 {log.notes}</div>}
+                            <div style={{color:C.faint,fontSize:11,marginTop:2}}>{log.source==="manual"?"Manual entry":"Timer session"}</div>
+                          </div>
+                          {isAdmin&&(
+                            <div style={{display:"flex",gap:8,flexShrink:0}}>
+                              <button onClick={()=>approveManual(log.id)} style={{...btnSm,background:C.green,color:"#fff",border:"none",fontSize:12}}>✓ Approve</button>
+                              <button onClick={()=>{setRejectLogId(log.id);setRejectModal(true);}} style={{...btnSm,background:C.red,color:"#fff",border:"none",fontSize:12}}>✕ Reject</button>
+                            </div>
+                          )}
+                          {!isAdmin&&<Bdg color={C.yellow}>Awaiting approval</Bdg>}
+                        </div>
+                      ))}
+                    </div>
+                  </Card>
+                )}
+              </div>
+            );
+          })()}
 
           {/* Log table */}
           <Card title="Log Entries" extra={
@@ -2427,17 +2504,21 @@ export default function App(){
     <div style={{minHeight:"100vh",width:"100%",background:C.bg,color:C.text,fontFamily:"'IBM Plex Sans','Segoe UI',system-ui,sans-serif"}}>
       <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700;800&family=DM+Mono:wght@400;500&display=swap" rel="stylesheet"/>
       <style>{`
-        *{box-sizing:border-box;}
+        *{box-sizing:border-box;-webkit-tap-highlight-color:transparent;}
+        html,body,#root{width:100%;overflow-x:hidden;}
         @media(max-width:768px){
           .kpi-grid{grid-template-columns:repeat(2,1fr)!important;}
           .kpi-grid-4{grid-template-columns:repeat(2,1fr)!important;}
           .hide-mobile{display:none!important;}
-          .modal-inner{padding:20px!important;width:96vw!important;}
-          .card-pad{padding:14px!important;}
-          .tab-content{padding:14px 12px!important;}
+          .modal-inner{padding:18px!important;width:98vw!important;margin:0 auto;}
+          .tab-content{padding:12px 10px!important;}
           .header-stats{display:none!important;}
-          table{font-size:12px!important;}
-          td,th{padding:7px 8px!important;}
+          table{font-size:12px!important;display:block;overflow-x:auto;-webkit-overflow-scrolling:touch;}
+          td,th{padding:7px 8px!important;white-space:nowrap;}
+          .two-col-grid{grid-template-columns:1fr!important;}
+          .three-col-grid{grid-template-columns:1fr!important;}
+          .kanban-grid{grid-template-columns:1fr!important;overflow-x:auto!important;}
+          input,select,textarea{font-size:16px!important;}
         }
         @media(max-width:480px){
           .kpi-grid{grid-template-columns:1fr 1fr!important;}
