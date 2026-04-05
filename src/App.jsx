@@ -272,7 +272,7 @@ function Spark({data,color=C.blue,threshold}){
 function PinLogin({accessUsers,onLogin}){
   const [pin,setPin]=useState(""); const [err,setErr]=useState("");
   const go=()=>{
-    if(pin==="ADMIN"){onLogin("__admin__");return;}
+    if(pin==="shubhi1234s"){onLogin("__admin__");return;}
     const u=accessUsers.find(u=>u.pin===pin&&u.pin);
     if(u){onLogin(u.id);setErr("");}else{setErr("Incorrect PIN. Contact your administrator.");setPin("");}
   };
