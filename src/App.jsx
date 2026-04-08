@@ -28,18 +28,48 @@ async function sbSet(table, value) {
   } catch(e) { console.error("Supabase write error:", table, e); }
 }
 
+const backupKey = table => `nes_backup_${table}`;
+const readBackup = (table, fallback) => {
+  try {
+    if (typeof window === "undefined") return fallback;
+    const raw = window.localStorage.getItem(backupKey(table));
+    if (!raw) return fallback;
+    return JSON.parse(raw);
+  } catch {
+    return fallback;
+  }
+};
+const writeBackup = (table, value) => {
+  try {
+    if (typeof window === "undefined") return;
+    window.localStorage.setItem(backupKey(table), JSON.stringify(value));
+  } catch {
+    // Ignore local backup write failures (quota/private mode).
+  }
+};
+
 // Drop-in replacement for useLS — loads from Supabase, syncs on change
 function useSupabase(table, init) {
   const [s, setS] = useState(init);
   const [loaded, setLoaded] = useState(false);
 
   useEffect(() => {
-    sbGet(table, init).then(v => { setS(v); setLoaded(true); });
+    let alive = true;
+    sbGet(table, init).then(v => {
+      if (!alive) return;
+      const fromFallback = v === init;
+      const next = fromFallback ? readBackup(table, init) : v;
+      setS(next);
+      writeBackup(table, next);
+      setLoaded(true);
+    });
+    return () => { alive = false; };
   }, [table]);
 
   const setAndSync = (valOrFn) => {
     setS(prev => {
       const next = typeof valOrFn === "function" ? valOrFn(prev) : valOrFn;
+      writeBackup(table, next);
       sbSet(table, next);
       return next;
     });
@@ -96,6 +126,7 @@ const RAMP_DEFAULT = [
 
 const DEFAULT_FIN = {
   targetMargin:35, qualityThreshold:90, infrastructureCost:0, otherOverhead:0,
+  payrollTz:"America/New_York",
   bonusTiers:[{name:"Bronze",minTasks:100,minQuality:90,bonusAmt:50},{name:"Silver",minTasks:150,minQuality:93,bonusAmt:150},{name:"Gold",minTasks:200,minQuality:96,bonusAmt:350}],
   regionRates:{US:30,EU:22,LATAM:12,APAC:10,Other:15},
 };
@@ -145,16 +176,40 @@ const isoDateInTZ=(iso,iana)=>{try{return new Intl.DateTimeFormat("en-CA",{timeZ
 const hasDayShift=(iso,tzA,tzB)=>tzA&&tzB&&tzA!==tzB?isoDateInTZ(iso,tzA)!==isoDateInTZ(iso,tzB):false;
 const fmtElapsed=s=>{const h=Math.floor(s/3600),m=Math.floor((s%3600)/60),sec=s%60;return[h,m,sec].map(n=>String(n).padStart(2,"0")).join(":");};
 const durStr=(s,e)=>{const ms=new Date(e)-new Date(s);if(ms<=0)return"—";const h=Math.floor(ms/3600000),m=Math.floor((ms%3600000)/60000);return h>0?`${h}h ${m}m`:`${m}m`;};
-const weekBounds=(baseDate=new Date())=>{
-  const ws=new Date(baseDate);
-  const dow=ws.getDay();
-  ws.setDate(ws.getDate()-(dow===0?6:dow-1));
-  ws.setHours(0,0,0,0);
-  const we=new Date(ws);we.setDate(ws.getDate()+7);
-  return { weekStart:ws, weekEnd:we };
+const shiftIsoDay=(dayStr,delta)=>{
+  const [y,m,d]=String(dayStr).split("-").map(Number);
+  if(![y,m,d].every(Number.isFinite)) return dayStr;
+  const dt=new Date(Date.UTC(y,m-1,d));
+  dt.setUTCDate(dt.getUTCDate()+delta);
+  return dt.toISOString().slice(0,10);
 };
-const opsMetricsById=(opsTeam,timeLogs,baseDate=new Date())=>{
-  const { weekStart, weekEnd }=weekBounds(baseDate);
+const weekdayIndexInTZ=(date,iana)=>{
+  try{
+    const wd=new Intl.DateTimeFormat("en-US",{timeZone:iana,weekday:"short"}).format(date);
+    const m={Sun:0,Mon:1,Tue:2,Wed:3,Thu:4,Fri:5,Sat:6};
+    return m[wd]??1;
+  }catch{return 1;}
+};
+const payrollWeekWindow=(baseDate=new Date(),iana="America/New_York")=>{
+  const baseDay=isoDateInTZ(baseDate.toISOString(),iana);
+  const dow=weekdayIndexInTZ(baseDate,iana);
+  const daysFromMonday=dow===0?6:dow-1;
+  const mondayDay=shiftIsoDay(baseDay,-daysFromMonday);
+  const nextMonday=shiftIsoDay(mondayDay,7);
+  const weekStartIso=wallClockToUTC(mondayDay,"00:00",iana);
+  const weekEndIso=wallClockToUTC(nextMonday,"00:00",iana);
+  return { weekStartIso, weekEndIso, mondayDay, nextMonday };
+};
+const clipMsToWindow=(startIso,endIso,winStartIso,winEndIso)=>{
+  const s=new Date(startIso).getTime();
+  const e=new Date(endIso).getTime();
+  const ws=new Date(winStartIso).getTime();
+  const we=new Date(winEndIso).getTime();
+  if(![s,e,ws,we].every(Number.isFinite)||e<=s||we<=ws) return 0;
+  return Math.max(0,Math.min(e,we)-Math.max(s,ws));
+};
+const opsMetricsById=(opsTeam,timeLogs,baseDate=new Date(),payrollTz="America/New_York")=>{
+  const { weekStartIso, weekEndIso }=payrollWeekWindow(baseDate,payrollTz);
   const byId={};
   opsTeam.forEach(o=>{byId[o.id]={approvedWeekHours:0,pendingWeekHours:0,approvedWeekPay:0,pendingWeekPay:0,totalApprovedPay:0,totalPendingPay:0};});
   const statusOf=l=>l.approvalStatus||"approved";
@@ -163,16 +218,18 @@ const opsMetricsById=(opsTeam,timeLogs,baseDate=new Date())=>{
     const ms=new Date(l.endTime)-new Date(l.startTime);
     if(ms<=0) return;
     const hrs=ms/3600000;
-    const inWeek=new Date(l.startTime)>=weekStart&&new Date(l.startTime)<weekEnd;
+    const weekMs=clipMsToWindow(l.startTime,l.endTime,weekStartIso,weekEndIso);
+    const inWeek=weekMs>0;
+    const weekHrs=weekMs/3600000;
     const rate=l.hourlyRateSnapshot??(opsTeam.find(o=>o.id===l.qmId)?.hourlyRate||0);
     const pay=hrs*rate;
     const st=statusOf(l);
     if(st==="approved"){
       byId[l.qmId].totalApprovedPay+=pay;
-      if(inWeek){byId[l.qmId].approvedWeekHours+=hrs;byId[l.qmId].approvedWeekPay+=pay;}
+      if(inWeek){byId[l.qmId].approvedWeekHours+=weekHrs;byId[l.qmId].approvedWeekPay+=weekHrs*rate;}
     }else if(st==="pending"){
       byId[l.qmId].totalPendingPay+=pay;
-      if(inWeek){byId[l.qmId].pendingWeekHours+=hrs;byId[l.qmId].pendingWeekPay+=pay;}
+      if(inWeek){byId[l.qmId].pendingWeekHours+=weekHrs;byId[l.qmId].pendingWeekPay+=weekHrs*rate;}
     }
   });
   return byId;
@@ -272,7 +329,7 @@ function Spark({data,color=C.blue,threshold}){
 function PinLogin({accessUsers,onLogin}){
   const [pin,setPin]=useState(""); const [err,setErr]=useState("");
   const go=()=>{
-    if(pin==="shubhi1234s"){onLogin("__admin__");return;}
+    if(pin==="shubhi12s"){onLogin("__admin__");return;}
     const u=accessUsers.find(u=>u.pin===pin&&u.pin);
     if(u){onLogin(u.id);setErr("");}else{setErr("Incorrect PIN. Contact your administrator.");setPin("");}
   };
@@ -339,7 +396,7 @@ function PersonTab({items,setItems,type,financials,timeLogs=[]}){
   const threshold=financials?.qualityThreshold||90;
   const withAHT=items.filter(x=>x.avgSpeed>0);
   const avgAHT=withAHT.length?withAHT.reduce((s,x)=>s+x.avgSpeed,0)/withAHT.length:0;
-  const opsMetrics=!isE&&!isR?opsMetricsById(items,timeLogs,new Date()):{};
+  const opsMetrics=!isE&&!isR?opsMetricsById(items,timeLogs,new Date(),financials?.payrollTz||"America/New_York"):{};
   const opsTotals=!isE&&!isR?items.reduce((acc,o)=>{
     const m=opsMetrics[o.id]||{};
     acc.approvedWeekHours+=(m.approvedWeekHours||0);
@@ -1223,7 +1280,7 @@ function FinancialsTab({experts,reviewers,opsTeam,timeLogs,financials,setFinanci
   const phase=PHASES.find(p=>p.id===activePhase);
   const regionRates=financials.regionRates||{US:30,EU:22,LATAM:12,APAC:10,Other:15};
   const updRegion=(r,v)=>setFinancials(p=>({...p,regionRates:{...(p.regionRates||{}),[r]:+v||0}}));
-  const opsMetrics=opsMetricsById(opsTeam,timeLogs||[],new Date());
+  const opsMetrics=opsMetricsById(opsTeam,timeLogs||[],new Date(),financials?.payrollTz||"America/New_York");
   const opsTotals=opsTeam.reduce((acc,o)=>{
     const m=opsMetrics[o.id]||{};
     acc.approvedWeekHours+=(m.approvedWeekHours||0);
@@ -1306,12 +1363,19 @@ function FinancialsTab({experts,reviewers,opsTeam,timeLogs,financials,setFinanci
       </Card>
       <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:20}}>
         <Card title="Global Settings">
+          <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"10px 0",borderBottom:`1px solid ${C.border}`}}>
+            <span style={{color:C.muted,fontSize:13}}>Payroll Timezone (official)</span>
+            <select value={financials.payrollTz||"America/New_York"} onChange={e=>setFinancials(p=>({...p,payrollTz:e.target.value}))} style={{...selStyle,width:180,fontSize:12,padding:"6px 10px"}}>
+              {TZ_OPTIONS.map(t=><option key={t.iana} value={t.iana}>{t.label}</option>)}
+            </select>
+          </div>
           {[["Infrastructure Cost ($)","infrastructureCost"],["Other Overhead ($)","otherOverhead"],["Target Margin %","targetMargin"],["Quality Threshold %","qualityThreshold"]].map(([label,field])=>(
             <div key={field} style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"10px 0",borderBottom:`1px solid ${C.border}`}}>
               <span style={{color:C.muted,fontSize:13}}>{label}</span>
               <InN value={financials[field]||0} onChange={v=>updF(field,v)} width="90px"/>
             </div>
           ))}
+          <div style={{marginTop:8,color:C.faint,fontSize:11}}>Weekly approved/pending hours and weekly pay are computed Monday–Sunday in this timezone.</div>
         </Card>
         <Card title="Regional Tiered Rates">
           <table style={{width:"100%",borderCollapse:"collapse"}}>
@@ -1467,7 +1531,7 @@ function VisualizationsTab({experts,reviewers,tickets,financials,taskTracker,ops
   const statusCounts=PERSON_STATUSES.map(s=>({status:s,experts:experts.filter(e=>e.status===s).length,reviewers:reviewers.filter(r=>r.status===s).length})).filter(x=>x.experts+x.reviewers>0);
   const weeklyTrend=taskTracker.map(w=>({week:w.label,attempts:w.newAnnotators*w.tasksPerWeekAnnotator,reviews:w.newReviewers*w.tasksPerWeekReviewer}));
   const ahtData=[...experts,...reviewers].filter(x=>x.avgSpeed>0).map(x=>({name:x.name.split(" ")[0],aht:x.avgSpeed,quality:x.qualityScore,type:experts.includes(x)?"Expert":"Reviewer"}));
-  const opsMetrics=opsMetricsById(opsTeam,timeLogs||[],new Date());
+  const opsMetrics=opsMetricsById(opsTeam,timeLogs||[],new Date(),financials?.payrollTz||"America/New_York");
   const opsWeeklyPay=opsTeam.map(o=>({name:o.name.split(" ")[0],weeklyPay:(opsMetrics[o.id]?.approvedWeekPay||0),pendingPay:(opsMetrics[o.id]?.pendingWeekPay||0),totalPaid:(opsMetrics[o.id]?.totalApprovedPay||0)})).filter(x=>x.weeklyPay>0||x.pendingPay>0||x.totalPaid>0);
 
   const chart={background:C.surface,border:`1px solid ${C.border}`,borderRadius:12,padding:22};
@@ -1551,7 +1615,7 @@ function RiskTab({experts,reviewers,tickets,financials,opsTeam,timeLogs,taskTrac
   const rampSBQ=rampData[0]?rampData[0].sbqDefault:null;
   const sbqDrift=avgSBQ&&rampSBQ?((avgSBQ-rampSBQ)/rampSBQ*100):null;
   const totalRev=PHASES.reduce((s,p)=>s+(phaseFinancials[p.id]?.revenue||p.revenue),0);
-  const opsMetrics=opsMetricsById(opsTeam,timeLogs||[],new Date());
+  const opsMetrics=opsMetricsById(opsTeam,timeLogs||[],new Date(),financials?.payrollTz||"America/New_York");
   const opsApprovedTotal=opsTeam.reduce((s,o)=>s+(opsMetrics[o.id]?.totalApprovedPay||0),0);
   const totalCosts=experts.reduce((s,e)=>s+e.tasksCompleted*e.perTaskRate+e.bonusEarned,0)+reviewers.reduce((s,r)=>s+r.tasksReviewed*r.perTaskRate+r.bonusEarned,0)+opsApprovedTotal+(financials.infrastructureCost||0)+(financials.otherOverhead||0);
   const margin=totalRev>0?(totalRev-totalCosts)/totalRev*100:null;
@@ -1708,9 +1772,11 @@ function AccessTab({accessUsers,setAccessUsers}){
 }
 
 // ─── TIME TRACKER ─────────────────────────────────────────────────────────────
-function TimeTrackerTab({timeLogs,setTimeLogs,qmSettings,setQmSettings,availEvents,setAvailEvents,opsTeam,accessUsers,currentUser,isAdmin}){
+function TimeTrackerTab({timeLogs,setTimeLogs,qmSettings,setQmSettings,availEvents,setAvailEvents,opsTeam,accessUsers,currentUser,isAdmin,financials}){
+  const payrollTz=financials?.payrollTz||"America/New_York";
   const [subTab,setSubTab]=useState("log");
-  const [viewTz,setViewTz]=useState("Europe/London");
+  const [viewTz,setViewTz]=useState(payrollTz);
+  const [dailyWeekOffset,setDailyWeekOffset]=useState(0);
   const [filterQm,setFilterQm]=useState("all");
   const [now,setNow]=useState(new Date());
   const [timer,setTimer]=useState({running:false,hasSession:false,sessionStartISO:null,adjustedStartISO:null,pausedElapsedMs:0,qmId:currentUser?.id||opsTeam[0]?.id||"",notes:"",activeLogId:null});
@@ -1779,15 +1845,44 @@ function TimeTrackerTab({timeLogs,setTimeLogs,qmSettings,setQmSettings,availEven
     const rate=l.hourlyRateSnapshot??(qm?.hourlyRate||0);
     return hoursForLog(l)*rate;
   };
+  const LOCK_TTL_MS=120000;
+  const isLockStale=log=>{
+    if(!log?.lastSeen) return true;
+    const age=Date.now()-new Date(log.lastSeen).getTime();
+    return !Number.isFinite(age)||age>LOCK_TTL_MS;
+  };
+  const hydrateTimerFromLog=log=>setTimer({
+    running:true,
+    hasSession:true,
+    sessionStartISO:log.startTime,
+    adjustedStartISO:log.startTime,
+    pausedElapsedMs:0,
+    qmId:log.qmId,
+    notes:log.notes||"",
+    activeLogId:log.id,
+  });
+  const claimLockIfAllowed=log=>{
+    if(!log) return false;
+    if(!log.lockedBy||log.lockedBy===TAB_ID||isLockStale(log)){
+      if(log.lockedBy!==TAB_ID){
+        const stamp=new Date().toISOString();
+        setTimeLogs(prev=>prev.map(l=>l.id===log.id?{...l,lockedBy:TAB_ID,lastSeen:stamp}:l));
+      }
+      return true;
+    }
+    alert("This session is active in another tab. If that tab is closed, wait ~2 minutes and retry.");
+    return false;
+  };
 
   // Single interval drives both live clock and elapsed display
   useEffect(()=>{const t=setInterval(()=>setNow(new Date()),1000);return()=>clearInterval(t);},[]);
 
   // Restore any active (unfinished) session in current scope
   useEffect(()=>{
-    const active=logsInScope.find(l=>!l.endTime);
-    if(active){setTimer({running:true,hasSession:true,sessionStartISO:active.startTime,adjustedStartISO:active.startTime,pausedElapsedMs:0,qmId:active.qmId,notes:active.notes||"",activeLogId:active.id});}
-  },[myQmId,isAdmin]);// eslint-disable-line react-hooks/exhaustive-deps
+    if(isAdmin) return;
+    const active=logsInScope.find(l=>!l.endTime&&(l.qmId===myQmId||l.qmId===resolvedQmId));
+    if(active&&claimLockIfAllowed(active)) hydrateTimerFromLog(active);
+  },[myQmId,isAdmin,resolvedQmId]);// eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(()=>{
     if(!isAdmin&&resolvedQmId){
@@ -1804,17 +1899,25 @@ function TimeTrackerTab({timeLogs,setTimeLogs,qmSettings,setQmSettings,availEven
   const getQmCfg=id=>qmSettings.find(s=>s.qmId===id)||{color:C.blue,homeTz:"UTC"};
   const tzAbbrFor=iana=>TZ_OPTIONS.find(t=>t.iana===iana)?.abbr||iana;
   const viewAbbr=tzAbbrFor(viewTz);
+  const payrollAbbr=tzAbbrFor(payrollTz);
 
   // Elapsed derived from `now` — no separate setInterval needed
   const elapsedMs=timer.running&&timer.adjustedStartISO?Math.max(0,now.getTime()-new Date(timer.adjustedStartISO).getTime()):timer.pausedElapsedMs;
   const elapsedSec=Math.floor(elapsedMs/1000);
 
   const startTimer=()=>{
+    if(!timer.qmId) return;
+    const existingActive=timeLogs.find(l=>!l.endTime&&l.qmId===timer.qmId);
+    if(existingActive){
+      if(!claimLockIfAllowed(existingActive)) return;
+      hydrateTimerFromLog(existingActive);
+      return;
+    }
     const nowISO=new Date().toISOString();
     if(!timer.hasSession){
       const newId="TL"+Date.now();
       const rate=(getQm(timer.qmId)?.hourlyRate||0);
-      setTimeLogs(prev=>[{id:newId,qmId:timer.qmId,startTime:nowISO,endTime:null,notes:timer.notes,source:"timer",approvalStatus:"pending",hourlyRateSnapshot:rate,lockedBy:TAB_ID},...prev]);
+      setTimeLogs(prev=>[{id:newId,qmId:timer.qmId,startTime:nowISO,endTime:null,notes:timer.notes,source:"timer",approvalStatus:"pending",hourlyRateSnapshot:rate,lockedBy:TAB_ID,lastSeen:nowISO},...prev]);
       setTimer(t=>({...t,running:true,hasSession:true,sessionStartISO:nowISO,adjustedStartISO:nowISO,pausedElapsedMs:0,activeLogId:newId}));
     } else {
       const resumed=new Date(Date.now()-timer.pausedElapsedMs).toISOString();
@@ -1823,16 +1926,16 @@ function TimeTrackerTab({timeLogs,setTimeLogs,qmSettings,setQmSettings,availEven
   };
   const pauseTimer=()=>{
     const activeLog=timeLogs.find(l=>l.id===timer.activeLogId);
-    if(activeLog&&activeLog.lockedBy&&activeLog.lockedBy!==TAB_ID){alert("This session is active in another tab.");return;}
+    if(!claimLockIfAllowed(activeLog)) return;
     const elapsed=Math.max(0,now.getTime()-new Date(timer.adjustedStartISO).getTime());
     setTimer(t=>({...t,running:false,pausedElapsedMs:elapsed}));
   };
   const stopTimer=()=>{
     const activeLog=timeLogs.find(l=>l.id===timer.activeLogId);
-    if(activeLog&&activeLog.lockedBy&&activeLog.lockedBy!==TAB_ID){alert("This session is active in another tab.");return;}
+    if(!claimLockIfAllowed(activeLog)) return;
     if(!timer.notes||!timer.notes.trim()){alert("Please add session notes describing what you worked on before stopping.");return;}
     const endTime=new Date().toISOString();
-    setTimeLogs(prev=>prev.map(l=>l.id===timer.activeLogId?{...l,endTime,notes:timer.notes,approvalStatus:"pending",editHistory:pushHistory(l,"timer_stop","Timer session completed — pending admin approval")}:l));
+    setTimeLogs(prev=>prev.map(l=>l.id===timer.activeLogId?{...l,endTime,notes:timer.notes,approvalStatus:"pending",lockedBy:null,lastSeen:endTime,editHistory:pushHistory(l,"timer_stop","Timer session completed — pending admin approval")}:l));
     setTimer({running:false,hasSession:false,sessionStartISO:null,adjustedStartISO:null,pausedElapsedMs:0,qmId:timer.qmId,notes:"",activeLogId:null});
   };
 
@@ -1840,31 +1943,20 @@ function TimeTrackerTab({timeLogs,setTimeLogs,qmSettings,setQmSettings,availEven
   const adminForceStop=(logId)=>{
     if(!confirm("Force-stop this active timer? The log will be closed at the current time and marked pending approval.")) return;
     const endTime=new Date().toISOString();
-    setTimeLogs(prev=>prev.map(l=>l.id===logId?{...l,endTime,approvalStatus:"pending",editHistory:pushHistory(l,"admin_force_stop","Admin force-stopped active timer")}:l));
+    setTimeLogs(prev=>prev.map(l=>l.id===logId?{...l,endTime,approvalStatus:"pending",lockedBy:null,lastSeen:endTime,editHistory:pushHistory(l,"admin_force_stop","Admin force-stopped active timer")}:l));
   };
 
-  // Auto-stop on tab close via beforeunload + visibility change
+  // Keep a lightweight heartbeat on active timers so locks can be reclaimed after refresh.
   useEffect(()=>{
-    const handleUnload=()=>{
-      if(timer.running&&timer.activeLogId){
-        const endTime=new Date().toISOString();
-        // Use navigator.sendBeacon for reliable unload — but since we use Supabase
-        // we update via the sync fn directly; this fires before unload completes
-        setTimeLogs(prev=>prev.map(l=>l.id===timer.activeLogId?{...l,endTime,approvalStatus:"pending",editHistory:[...(l.editHistory||[]),{at:endTime,by:"system",action:"auto_stop",note:"Timer auto-stopped: tab closed"}]}:l));
-      }
+    if(!timer.running||!timer.activeLogId) return;
+    const touch=()=>{
+      const stamp=new Date().toISOString();
+      setTimeLogs(prev=>prev.map(l=>l.id===timer.activeLogId?{...l,lastSeen:stamp,lockedBy:TAB_ID}:l));
     };
-    const handleVisibility=()=>{
-      if(document.visibilityState==="hidden"&&timer.running&&timer.activeLogId){
-        // Mark in Supabase that this session should be considered stopped
-        // We don't stop immediately on hide (user may switch tabs briefly)
-        // but we update the log's lastSeen time
-        sbSet("time_logs",timeLogs.map(l=>l.id===timer.activeLogId?{...l,lastSeen:new Date().toISOString()}:l));
-      }
-    };
-    window.addEventListener("beforeunload",handleUnload);
-    document.addEventListener("visibilitychange",handleVisibility);
-    return()=>{window.removeEventListener("beforeunload",handleUnload);document.removeEventListener("visibilitychange",handleVisibility);};
-  },[timer.running,timer.activeLogId,timer.notes]);
+    touch();
+    const t=setInterval(touch,30000);
+    return()=>clearInterval(t);
+  },[timer.running,timer.activeLogId]);
 
   const updateQmCfg=(qmId,patch)=>setQmSettings(prev=>{
     const exists=prev.find(s=>s.qmId===qmId);
@@ -1872,13 +1964,15 @@ function TimeTrackerTab({timeLogs,setTimeLogs,qmSettings,setQmSettings,availEven
     return[...prev,{qmId,color:C.blue,homeTz:"UTC",...patch}];
   });
 
-  // Week boundaries (Mon–Sun) for calendar + KPIs
-  const weekStart=new Date(now);
-  const dow=weekStart.getDay();
-  weekStart.setDate(weekStart.getDate()-(dow===0?6:dow-1));
-  weekStart.setHours(0,0,0,0);
-  const weekEnd=new Date(weekStart);weekEnd.setDate(weekStart.getDate()+7);
-  const weekDays=Array.from({length:7},(_,i)=>{const d=new Date(weekStart);d.setDate(weekStart.getDate()+i);return d;});
+  // Payroll week boundaries (Mon–Sun) for official weekly totals
+  const { weekStartIso, weekEndIso, mondayDay }=payrollWeekWindow(now,payrollTz);
+  const selectedMondayDay=shiftIsoDay(mondayDay,dailyWeekOffset*7);
+  const selectedWeekDayKeys=Array.from({length:7},(_,i)=>shiftIsoDay(selectedMondayDay,i));
+  const fmtIsoDay=(isoDay,opts)=>{
+    const [y,m,d]=String(isoDay).split("-").map(Number);
+    if(![y,m,d].every(Number.isFinite)) return "—";
+    return new Date(Date.UTC(y,m-1,d)).toLocaleDateString("en-GB",{timeZone:"UTC",...opts});
+  };
 
   const msToDur=ms=>{const h=Math.floor(ms/3600000),m=Math.floor((ms%3600000)/60000);return h>0?`${h}h ${m}m`:`${m}m`;};
   const msClippedToDay = (log, dayDate, iana) => {
@@ -1907,10 +2001,17 @@ function TimeTrackerTab({timeLogs,setTimeLogs,qmSettings,setQmSettings,availEven
   const pendingLogsInScope=logsInScope.filter(l=>l.endTime&&logStatus(l)==="pending");
   const rejectedLogsInScope=logsInScope.filter(l=>l.endTime&&logStatus(l)==="rejected");
 
-  const myHours=approvedLogsInScope.filter(l=>new Date(l.startTime)>=weekStart&&new Date(l.startTime)<weekEnd).reduce((s,l)=>s+(new Date(l.endTime)-new Date(l.startTime)),0);
-  const pendingHours=pendingLogsInScope.filter(l=>new Date(l.startTime)>=weekStart&&new Date(l.startTime)<weekEnd).reduce((s,l)=>s+(new Date(l.endTime)-new Date(l.startTime)),0);
-  const myPayWeek=approvedLogsInScope.filter(l=>new Date(l.startTime)>=weekStart&&new Date(l.startTime)<weekEnd).reduce((s,l)=>s+payForLog(l),0);
-  const pendingPayWeek=pendingLogsInScope.filter(l=>new Date(l.startTime)>=weekStart&&new Date(l.startTime)<weekEnd).reduce((s,l)=>s+payForLog(l),0);
+  const weeklyPayForLog=(l)=>{
+    const qm=opsTeam.find(o=>o.id===l.qmId)||(l.qmId===myQmId?fallbackMyQm:null);
+    const rate=l.hourlyRateSnapshot??(qm?.hourlyRate||0);
+    const weekHours=clipMsToWindow(l.startTime,l.endTime,weekStartIso,weekEndIso)/3600000;
+    return weekHours*rate;
+  };
+
+  const myHours=approvedLogsInScope.reduce((s,l)=>s+clipMsToWindow(l.startTime,l.endTime,weekStartIso,weekEndIso),0);
+  const pendingHours=pendingLogsInScope.reduce((s,l)=>s+clipMsToWindow(l.startTime,l.endTime,weekStartIso,weekEndIso),0);
+  const myPayWeek=approvedLogsInScope.reduce((s,l)=>s+weeklyPayForLog(l),0);
+  const pendingPayWeek=pendingLogsInScope.reduce((s,l)=>s+weeklyPayForLog(l),0);
   const approvedPayTotal=approvedLogsInScope.reduce((s,l)=>s+payForLog(l),0);
   const pendingPayTotal=pendingLogsInScope.reduce((s,l)=>s+payForLog(l),0);
 
@@ -2038,10 +2139,10 @@ function TimeTrackerTab({timeLogs,setTimeLogs,qmSettings,setQmSettings,availEven
       {subTab==="log"&&(
         <div style={{display:"flex",flexDirection:"column",gap:16}}>
           <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:14}}>
-            <KPI label="Approved Time This Week" value={myHours>0?msToDur(myHours):"0h"} color={C.blue} icon="⏱"/>
-            <KPI label="Approved Pay This Week" value={fmtU(myPayWeek)} color={C.green} icon="💵"/>
-            <KPI label="Pending Time This Week" value={pendingHours>0?msToDur(pendingHours):"0h"} color={C.yellow} icon="🕒"/>
-            <KPI label="Pending Pay This Week" value={fmtU(pendingPayWeek)} color={C.orange} icon="🧾" sub={isAdmin?`${pendingLogsInScope.length} pending request(s)`:"awaiting admin approval"}/>
+            <KPI label="Approved Time This Week" value={myHours>0?msToDur(myHours):"0h"} color={C.blue} icon="⏱" sub={`official week (${payrollAbbr})`}/>
+            <KPI label="Approved Pay This Week" value={fmtU(myPayWeek)} color={C.green} icon="💵" sub={`official week (${payrollAbbr})`}/>
+            <KPI label="Pending Time This Week" value={pendingHours>0?msToDur(pendingHours):"0h"} color={C.yellow} icon="🕒" sub={`official week (${payrollAbbr})`}/>
+            <KPI label="Pending Pay This Week" value={fmtU(pendingPayWeek)} color={C.orange} icon="🧾" sub={isAdmin?`${pendingLogsInScope.length} pending request(s) · ${payrollAbbr}`:`awaiting admin approval · ${payrollAbbr}`}/>
           </div>
 
           <Card title="Payments Summary">
@@ -2263,40 +2364,48 @@ function TimeTrackerTab({timeLogs,setTimeLogs,qmSettings,setQmSettings,availEven
       {/* ── DAILY LOG ─────────────────────────────────────────────────────── */}
       {subTab==="daily"&&(
         <div style={{display:"flex",flexDirection:"column",gap:16}}>
-          <Card title={`Daily Hours · Week of ${weekDays[0].toLocaleDateString("en-GB",{day:"numeric",month:"short"})} – ${weekDays[6].toLocaleDateString("en-GB",{day:"numeric",month:"short"})}`} extra={<div style={{display:"flex",gap:8,alignItems:"center",flexWrap:"wrap"}}>
+          <Card title={`Daily Hours (Official Payroll Week) · ${fmtIsoDay(selectedWeekDayKeys[0],{day:"numeric",month:"short"})} – ${fmtIsoDay(selectedWeekDayKeys[6],{day:"numeric",month:"short"})}`} extra={<div style={{display:"flex",gap:8,alignItems:"center",flexWrap:"wrap"}}>
+            <button onClick={()=>setDailyWeekOffset(v=>v-1)} style={{...btnSm,fontSize:12}}>← Previous Week</button>
+            <button onClick={()=>setDailyWeekOffset(0)} style={{...btnSm,fontSize:12,background:dailyWeekOffset===0?C.blue:C.surface,color:dailyWeekOffset===0?"#fff":C.text,border:dailyWeekOffset===0?"none":`1px solid ${C.border}`}}>This Week</button>
+            <button onClick={()=>setDailyWeekOffset(v=>v+1)} style={{...btnSm,fontSize:12}}>Next Week →</button>
             {isAdmin&&<select value={filterQm} onChange={e=>setFilterQm(e.target.value)} style={{...selStyle,width:150,fontSize:12}}>
               <option value="all">All QMs</option>
               {opsTeam.map(o=><option key={o.id} value={o.id}>{o.name}</option>)}
             </select>}
             <ExBtn onClick={()=>{
               const scoped=(isAdmin&&filterQm!=="all")?logsInScope.filter(l=>l.qmId===filterQm):logsInScope;
-              const rows=weekDays.map(d=>{
-                const ds=isoDateInTZ(d.toISOString(),viewTz);
-                const dayLogs=scoped.filter(l=>l.endTime&&isoDateInTZ(l.startTime,viewTz)===ds);
-                const approvedMs=dayLogs.filter(l=>logStatus(l)==="approved").reduce((s,l)=>s+msClippedToDay(l,d,viewTz),0);
-                const pendingMs=dayLogs.filter(l=>logStatus(l)==="pending").reduce((s,l)=>s+msClippedToDay(l,d,viewTz),0);
-                return {Day:d.toLocaleDateString("en-GB",{weekday:"short"}),Date:d.toLocaleDateString("en-GB",{day:"2-digit",month:"short"}),"Approved Hrs":+(approvedMs/3600000).toFixed(2),"Pending Hrs":+(pendingMs/3600000).toFixed(2),"Total Hrs":+((approvedMs+pendingMs)/3600000).toFixed(2),Entries:dayLogs.length};
+              const rows=selectedWeekDayKeys.map(ds=>{
+                const [y,m,d]=ds.split("-").map(Number);
+                const dayRef=new Date(Date.UTC(y,m-1,d));
+                const dayLogs=scoped.filter(l=>l.endTime&&msClippedToDay(l,dayRef,payrollTz)>0);
+                const approvedMs=dayLogs.filter(l=>logStatus(l)==="approved").reduce((s,l)=>s+msClippedToDay(l,dayRef,payrollTz),0);
+                const pendingMs=dayLogs.filter(l=>logStatus(l)==="pending").reduce((s,l)=>s+msClippedToDay(l,dayRef,payrollTz),0);
+                return {Day:fmtIsoDay(ds,{weekday:"short"}),Date:fmtIsoDay(ds,{day:"2-digit",month:"short"}),"Approved Hrs":+(approvedMs/3600000).toFixed(2),"Pending Hrs":+(pendingMs/3600000).toFixed(2),"Total Hrs":+((approvedMs+pendingMs)/3600000).toFixed(2),Entries:dayLogs.length};
               });
               dlXLSX([{name:"Daily Hours",data:rows}],"NES_Daily_Time_Log");
             }} label="⬇ Export"/>
           </div>}>
+            <div style={{marginBottom:10,padding:"10px 12px",background:C.blueSoft,border:`1px solid ${C.blue}30`,borderRadius:8,color:C.blueText,fontSize:12,lineHeight:1.6}}>
+              <strong>Official basis:</strong> Daily totals here are calculated in <strong>{payrollAbbr}</strong> (payroll timezone) and are used for weekly pay. Changing display timezone elsewhere does not change these totals.
+            </div>
             <div style={{overflowX:"auto"}}>
               <table style={{width:"100%",borderCollapse:"collapse",minWidth:700}}>
                 <TH cols={["Day","Date","Approved Hours","Pending Hours","Total Hours","Entries"]}/>
                 <tbody>
-                  {weekDays.map((day,i)=>{
-                    const ds=isoDateInTZ(day.toISOString(),viewTz);
+                  {selectedWeekDayKeys.map((ds,i)=>{
+                    const [y,m,d]=ds.split("-").map(Number);
+                    const dayRef=new Date(Date.UTC(y,m-1,d));
                     const scoped=(isAdmin&&filterQm!=="all")?logsInScope.filter(l=>l.qmId===filterQm):logsInScope;
-                    const dayLogs=scoped.filter(l=>l.endTime&&isoDateInTZ(l.startTime,viewTz)===ds);
-                    const approvedMs=dayLogs.filter(l=>logStatus(l)==="approved").reduce((s,l)=>s+msClippedToDay(l,day,viewTz),0);
-                    const pendingMs=dayLogs.filter(l=>logStatus(l)==="pending").reduce((s,l)=>s+msClippedToDay(l,day,viewTz),0);
+                    const dayLogs=scoped.filter(l=>l.endTime&&msClippedToDay(l,dayRef,payrollTz)>0);
+                    const approvedMs=dayLogs.filter(l=>logStatus(l)==="approved").reduce((s,l)=>s+msClippedToDay(l,dayRef,payrollTz),0);
+                    const pendingMs=dayLogs.filter(l=>logStatus(l)==="pending").reduce((s,l)=>s+msClippedToDay(l,dayRef,payrollTz),0);
                     const totalMs=approvedMs+pendingMs;
-                    const isToday=isoDateInTZ(now.toISOString(),viewTz)===ds;
-                    const hasCrossMidnight=dayLogs.some(l=>l.endTime&&isoDateInTZ(l.endTime,viewTz)!==isoDateInTZ(l.startTime,viewTz));
+                    const isToday=isoDateInTZ(now.toISOString(),payrollTz)===ds;
+                    const hasCrossMidnight=dayLogs.some(l=>l.endTime&&isoDateInTZ(l.endTime,payrollTz)!==isoDateInTZ(l.startTime,payrollTz));
                     return(
                       <tr key={ds} style={{borderTop:`1px solid ${C.border}`,background:isToday?C.blueSoft:(i%2?"#fafafa":C.surface)}}>
-                        <td style={{padding:"10px 14px",fontWeight:700}}>{day.toLocaleDateString("en-GB",{weekday:"short"})}</td>
-                        <td style={{padding:"10px 14px",color:C.muted,fontSize:13}}>{day.toLocaleDateString("en-GB",{day:"2-digit",month:"short"})}</td>
+                        <td style={{padding:"10px 14px",fontWeight:700}}>{fmtIsoDay(ds,{weekday:"short"})}</td>
+                        <td style={{padding:"10px 14px",color:C.muted,fontSize:13}}>{fmtIsoDay(ds,{day:"2-digit",month:"short"})}</td>
                         <td style={{padding:"10px 14px",fontFamily:"'DM Mono',monospace",color:C.green}}>{(approvedMs/3600000).toFixed(2)}h</td>
                         <td style={{padding:"10px 14px",fontFamily:"'DM Mono',monospace",color:C.yellowText}}>{(pendingMs/3600000).toFixed(2)}h</td>
                         <td style={{padding:"10px 14px",fontFamily:"'DM Mono',monospace",fontWeight:700,color:C.text}}>{(totalMs/3600000).toFixed(2)}h</td>
@@ -2310,7 +2419,7 @@ function TimeTrackerTab({timeLogs,setTimeLogs,qmSettings,setQmSettings,availEven
                 </tbody>
               </table>
             </div>
-            <div style={{marginTop:10,fontSize:11,color:C.faint}}>Hours are clipped to each calendar day boundary in {viewAbbr}. Cross-midnight logs are split across days and flagged with ⚠.</div>
+            <div style={{marginTop:10,fontSize:11,color:C.faint}}>Official totals are clipped to payroll day boundaries in {payrollAbbr}. Cross-midnight logs are split across days and flagged with ⚠.</div>
           </Card>
         </div>
       )}
@@ -2496,7 +2605,7 @@ export default function App(){
     Financials:<FinancialsTab experts={experts} reviewers={reviewers} opsTeam={opsTeam} timeLogs={timeLogs} financials={financials} setFinancials={setFinancials} phaseFinancials={phaseFinancials} setPhaseFinancials={setPhaseFinancials} taskTracker={taskTracker}/>,
     Visualizations:<VisualizationsTab experts={experts} reviewers={reviewers} tickets={tickets} financials={financials} taskTracker={taskTracker} opsTeam={opsTeam} timeLogs={timeLogs}/>,
     Risk:<RiskTab experts={experts} reviewers={reviewers} tickets={tickets} financials={financials} opsTeam={opsTeam} timeLogs={timeLogs} taskTracker={taskTracker} rampData={rampData} phaseFinancials={phaseFinancials}/>,
-    "Time Tracker":<TimeTrackerTab timeLogs={timeLogs} setTimeLogs={setTimeLogs} qmSettings={qmSettings} setQmSettings={setQmSettings} availEvents={availEvents} setAvailEvents={setAvailEvents} opsTeam={opsTeam} accessUsers={accessUsers} currentUser={currentUser} isAdmin={isAdmin}/>,
+    "Time Tracker":<TimeTrackerTab timeLogs={timeLogs} setTimeLogs={setTimeLogs} qmSettings={qmSettings} setQmSettings={setQmSettings} availEvents={availEvents} setAvailEvents={setAvailEvents} opsTeam={opsTeam} accessUsers={accessUsers} currentUser={currentUser} isAdmin={isAdmin} financials={financials}/>,
     Access:<AccessTab accessUsers={accessUsers} setAccessUsers={setAccessUsers}/>,
   };
 
