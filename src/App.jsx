@@ -12,20 +12,100 @@ const SUPA_URL = "https://qhhcdoovufokxbkaytgc.supabase.co";
 const SUPA_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InFoaGNkb292dWZva3hia2F5dGdjIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzUyNjU4NTcsImV4cCI6MjA5MDg0MTg1N30.czV5KxG6LiRfJBdFiWSxmTGDPnlW8brMmD4Wu4wI-HE";
 const sb = createClient(SUPA_URL, SUPA_KEY);
 
+const SB_ENVELOPE_KEY = "__nes_envelope_v1";
+const singletonWriteQueues = new Map();
+const rowWriteQueues = new Map();
+
+const isObject = v => !!v && typeof v === "object";
+const isEnvelope = v => isObject(v) && !Array.isArray(v) && v[SB_ENVELOPE_KEY] === true && Object.prototype.hasOwnProperty.call(v, "payload");
+const wrapStoredValue = (payload, rev = 0) => ({ [SB_ENVELOPE_KEY]: true, rev, updatedAt: new Date().toISOString(), payload });
+const unwrapStoredValue = (value, fallback) => (isEnvelope(value) ? (value.payload ?? fallback) : (value ?? fallback));
+const readStoredRev = value => (isEnvelope(value) ? (Number(value.rev) || 0) : 0);
+
+const newIdToken = () => {
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") return crypto.randomUUID();
+  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2,10)}`;
+};
+const makeId = prefix => `${prefix}-${newIdToken()}`;
+const reserveUniqueId = (usedIds, prefix) => {
+  let candidate = makeId(prefix);
+  let guard = 0;
+  while (usedIds.has(candidate) && guard < 30) {
+    candidate = makeId(prefix);
+    guard += 1;
+  }
+  usedIds.add(candidate);
+  return candidate;
+};
+const uniqueIdForItems = (items, prefix) => {
+  const used = new Set((Array.isArray(items) ? items : []).map(item => (item?.id == null ? "" : String(item.id))).filter(Boolean));
+  return reserveUniqueId(used, prefix);
+};
+const normalizeIdCollection = (items, prefix) => {
+  const list = Array.isArray(items) ? items : [];
+  const used = new Set();
+  let changed = false;
+  const normalized = [];
+
+  list.forEach(item => {
+    if (!isObject(item) || Array.isArray(item)) {
+      changed = true;
+      return;
+    }
+
+    const currentId = item.id == null ? "" : String(item.id);
+    if (!currentId || used.has(currentId)) {
+      const nextId = reserveUniqueId(used, prefix);
+      normalized.push({ ...item, id: nextId });
+      changed = true;
+      return;
+    }
+
+    used.add(currentId);
+    normalized.push(item);
+  });
+
+  return { items: normalized, changed };
+};
+const sameJSON = (a, b) => {
+  try {
+    return JSON.stringify(a) === JSON.stringify(b);
+  } catch {
+    return false;
+  }
+};
+
 // Each "collection" is stored as a single row in its table with id='singleton'
 // For arrays (experts, reviewers etc) we store the whole array as a jsonb value
 // This keeps the schema dead-simple and avoids per-row complexity
-async function sbGet(table, fallback) {
+async function sbGetRawSingleton(table) {
   try {
     const { data, error } = await sb.from(table).select("data").eq("id","singleton").maybeSingle();
-    if (error || !data) return fallback;
-    return data.data ?? fallback;
-  } catch { return fallback; }
+    if (error || !data) return { exists: false, raw: null };
+    return { exists: true, raw: data.data };
+  } catch {
+    return { exists: false, raw: null };
+  }
 }
-async function sbSet(table, value) {
+async function sbGet(table, fallback) {
+  const { exists, raw } = await sbGetRawSingleton(table);
+  if (!exists) return fallback;
+  return unwrapStoredValue(raw, fallback);
+}
+async function sbGetWithVersion(table, fallback) {
+  const { exists, raw } = await sbGetRawSingleton(table);
+  if (!exists) return { value: fallback, rev: 0 };
+  return { value: unwrapStoredValue(raw, fallback), rev: readStoredRev(raw) };
+}
+async function sbSet(table, value, rev) {
   try {
-    await sb.from(table).upsert({ id:"singleton", data: value }, { onConflict:"id" });
-  } catch(e) { console.error("Supabase write error:", table, e); }
+    const payload = Number.isFinite(rev) ? wrapStoredValue(value, rev) : value;
+    await sb.from(table).upsert({ id:"singleton", data: payload }, { onConflict:"id" });
+    return true;
+  } catch(e) {
+    console.error("Supabase write error:", table, e);
+    return false;
+  }
 }
 
 const backupKey = table => `nes_backup_${table}`;
@@ -48,10 +128,187 @@ const writeBackup = (table, value) => {
   }
 };
 
+function queueSingletonWrite(table, valOrFn, fallbackValue) {
+  const chained = (singletonWriteQueues.get(table) || Promise.resolve())
+    .catch(() => null)
+    .then(async () => {
+      const latest = await sbGetWithVersion(table, fallbackValue);
+      const next = typeof valOrFn === "function" ? valOrFn(latest.value) : valOrFn;
+      const ok = await sbSet(table, next, latest.rev + 1);
+      if (!ok) return null;
+      writeBackup(table, next);
+      return next;
+    })
+    .catch(e => {
+      console.error("Supabase singleton sync error:", table, e);
+      return null;
+    });
+
+  singletonWriteQueues.set(table, chained);
+  return chained;
+}
+
+const toRowMap = rows => {
+  const map = new Map();
+  (Array.isArray(rows) ? rows : []).forEach(item => {
+    if (!isObject(item) || Array.isArray(item) || item.id == null) return;
+    map.set(String(item.id), item);
+  });
+  return map;
+};
+
+const chunkArray = (items, size = 200) => {
+  const chunks = [];
+  for (let i = 0; i < items.length; i += size) {
+    chunks.push(items.slice(i, i + size));
+  }
+  return chunks;
+};
+
+async function sbFetchRowsByIds(table, ids) {
+  const uniqueIds = Array.from(new Set((Array.isArray(ids) ? ids : []).filter(Boolean)));
+  const map = new Map();
+  if (uniqueIds.length === 0) return map;
+
+  const chunks = chunkArray(uniqueIds, 200);
+  for (let i = 0; i < chunks.length; i += 1) {
+    const { data, error } = await sb.from(table).select("id,data").in("id", chunks[i]);
+    if (error) throw error;
+    (Array.isArray(data) ? data : []).forEach(row => {
+      const item = unwrapStoredValue(row.data, null);
+      if (!isObject(item) || Array.isArray(item)) return;
+      map.set(String(row.id), item);
+    });
+  }
+
+  return map;
+}
+
+const isClosedTimeLog = item => isObject(item) && !Array.isArray(item) && !!item.endTime;
+
+async function sbSyncRows(table, prevRows, nextRows, options = {}) {
+  try {
+    const prevMap = toRowMap(prevRows);
+    const nextMap = toRowMap(nextRows);
+
+    const upsertCandidates = [];
+    nextMap.forEach((item, id) => {
+      const prevItem = prevMap.get(id);
+      if (!prevItem || !sameJSON(prevItem, item)) {
+        upsertCandidates.push({ id, prevItem: prevItem || null, nextItem: item });
+      }
+    });
+
+    const deletionCandidates = [];
+    prevMap.forEach((item, id) => {
+      if (!nextMap.has(id)) deletionCandidates.push({ id, prevItem: item });
+    });
+
+    const affectedIds = Array.from(new Set([
+      ...upsertCandidates.map(c => c.id),
+      ...deletionCandidates.map(c => c.id),
+    ]));
+
+    const serverMap = await sbFetchRowsByIds(table, affectedIds);
+    const upserts = [];
+    const deletions = [];
+    let skippedConflicts = 0;
+
+    upsertCandidates.forEach(({ id, prevItem, nextItem }) => {
+      const serverItem = serverMap.get(id);
+
+      // New row creation should not overwrite an existing, divergent row.
+      if (!prevItem) {
+        if (!serverItem) {
+          upserts.push({ id, data: nextItem });
+          return;
+        }
+        if (!sameJSON(serverItem, nextItem)) skippedConflicts += 1;
+        return;
+      }
+
+      // If the row disappeared remotely, treat as conflict and skip stale resurrection.
+      if (!serverItem) {
+        skippedConflicts += 1;
+        return;
+      }
+
+      // Idempotent update already applied remotely.
+      if (sameJSON(serverItem, nextItem)) return;
+
+      // Protect against stale tabs reopening an already closed timer session.
+      if (table === "time_logs" && isClosedTimeLog(serverItem) && !isClosedTimeLog(nextItem)) {
+        skippedConflicts += 1;
+        return;
+      }
+
+      // Allow stop transitions (open -> closed) even if lock heartbeat changed on server.
+      if (table === "time_logs" && !isClosedTimeLog(prevItem) && isClosedTimeLog(nextItem) && !isClosedTimeLog(serverItem)) {
+        upserts.push({ id, data: nextItem });
+        return;
+      }
+
+      // Standard optimistic check: only write if server still matches caller's base snapshot.
+      if (sameJSON(serverItem, prevItem)) {
+        upserts.push({ id, data: nextItem });
+        return;
+      }
+
+      skippedConflicts += 1;
+    });
+
+    deletionCandidates.forEach(({ id, prevItem }) => {
+      const serverItem = serverMap.get(id);
+      if (!serverItem) return;
+      if (sameJSON(serverItem, prevItem)) {
+        deletions.push(id);
+        return;
+      }
+      skippedConflicts += 1;
+    });
+
+    if (upserts.length > 0) {
+      const { error } = await sb.from(table).upsert(upserts, { onConflict: "id" });
+      if (error) throw error;
+    }
+    if (deletions.length > 0) {
+      const { error } = await sb.from(table).delete().in("id", deletions);
+      if (error) throw error;
+    }
+    if (options.cleanupSingleton) {
+      const { error } = await sb.from(table).delete().eq("id", "singleton");
+      if (error) console.error("Supabase singleton cleanup error:", table, error);
+    }
+
+    if (skippedConflicts > 0) {
+      console.warn("Supabase row sync conflict skipped:", table, skippedConflicts);
+    }
+
+    return true;
+  } catch (e) {
+    console.error("Supabase row sync error:", table, e);
+    return false;
+  }
+}
+
+function queueRowWrite(table, prevRows, nextRows, options = {}) {
+  const chained = (rowWriteQueues.get(table) || Promise.resolve())
+    .catch(() => null)
+    .then(() => sbSyncRows(table, prevRows, nextRows, options))
+    .catch(e => {
+      console.error("Supabase row queue error:", table, e);
+      return false;
+    });
+
+  rowWriteQueues.set(table, chained);
+  return chained;
+}
+
 // Drop-in replacement for useLS — loads from Supabase, syncs on change
 function useSupabase(table, init) {
   const [s, setS] = useState(init);
   const [loaded, setLoaded] = useState(false);
+  const writeSeq = useRef(0);
 
   useEffect(() => {
     let alive = true;
@@ -64,13 +321,119 @@ function useSupabase(table, init) {
       setLoaded(true);
     });
     return () => { alive = false; };
-  }, [table]);
+  }, [table, init]);
 
   const setAndSync = (valOrFn) => {
+    const seq = ++writeSeq.current;
     setS(prev => {
       const next = typeof valOrFn === "function" ? valOrFn(prev) : valOrFn;
       writeBackup(table, next);
-      sbSet(table, next);
+
+      queueSingletonWrite(table, valOrFn, next).then(committed => {
+        if (committed == null || seq !== writeSeq.current) return;
+        setS(curr => (sameJSON(curr, committed) ? curr : committed));
+      });
+
+      return next;
+    });
+  };
+
+  return [s, setAndSync, loaded];
+}
+
+function useSupabaseRows(table, init, idPrefix) {
+  const [s, setS] = useState(init);
+  const [loaded, setLoaded] = useState(false);
+  const modeRef = useRef("rows");
+  const writeSeq = useRef(0);
+
+  useEffect(() => {
+    let alive = true;
+
+    (async () => {
+      try {
+        const { data, error } = await sb.from(table).select("id,data");
+        if (error) throw error;
+
+        const rows = Array.isArray(data) ? data : [];
+        const singletonRow = rows.find(r => r.id === "singleton");
+        const rowItems = rows
+          .filter(r => r.id !== "singleton")
+          .map(r => unwrapStoredValue(r.data, null))
+          .filter(item => isObject(item) && !Array.isArray(item));
+
+        const singletonRaw = singletonRow ? unwrapStoredValue(singletonRow.data, init) : [];
+        const singletonItems = Array.isArray(singletonRaw)
+          ? singletonRaw.filter(item => isObject(item) && !Array.isArray(item))
+          : [];
+
+        const merged = [...rowItems];
+        const seen = new Set(rowItems.map(item => String(item.id ?? "")).filter(Boolean));
+        singletonItems.forEach(item => {
+          const key = item.id == null ? "" : String(item.id);
+          if (key && seen.has(key)) return;
+          merged.push(item);
+          if (key) seen.add(key);
+        });
+
+        const base = merged.length > 0 ? merged : readBackup(table, init);
+        const normalized = normalizeIdCollection(base, idPrefix);
+        const next = normalized.items;
+
+        modeRef.current = "rows";
+        if ((singletonRow && singletonItems.length > 0) || normalized.changed) {
+          queueRowWrite(table, rowItems, next, { cleanupSingleton: true }).then(ok => {
+            if (!ok) modeRef.current = "singleton";
+          });
+        }
+
+        if (!alive) return;
+        setS(next);
+        writeBackup(table, next);
+        setLoaded(true);
+      } catch {
+        modeRef.current = "singleton";
+        const fallback = await sbGet(table, init);
+        const normalized = normalizeIdCollection(fallback, idPrefix);
+        if (!alive) return;
+        setS(normalized.items);
+        writeBackup(table, normalized.items);
+        setLoaded(true);
+        if (normalized.changed) queueSingletonWrite(table, normalized.items, normalized.items);
+      }
+    })();
+
+    return () => { alive = false; };
+  }, [table, idPrefix, init]);
+
+  const setAndSync = (valOrFn) => {
+    const seq = ++writeSeq.current;
+    setS(prev => {
+      const calculated = typeof valOrFn === "function" ? valOrFn(prev) : valOrFn;
+      const normalized = normalizeIdCollection(calculated, idPrefix);
+      const next = normalized.items;
+      writeBackup(table, next);
+
+      if (modeRef.current === "rows") {
+        queueRowWrite(table, prev, next, { cleanupSingleton: true }).then(ok => {
+          if (ok) return;
+          modeRef.current = "singleton";
+          queueSingletonWrite(table, next, next).then(committed => {
+            if (committed == null || seq !== writeSeq.current) return;
+            const fixed = normalizeIdCollection(committed, idPrefix).items;
+            setS(curr => (sameJSON(curr, fixed) ? curr : fixed));
+            writeBackup(table, fixed);
+          });
+        });
+      } else {
+        queueSingletonWrite(table, next, next).then(committed => {
+          if (committed == null || seq !== writeSeq.current) return;
+          const fixed = normalizeIdCollection(committed, idPrefix).items;
+          setS(curr => (sameJSON(curr, fixed) ? curr : fixed));
+          writeBackup(table, fixed);
+        });
+      }
+
       return next;
     });
   };
@@ -126,7 +489,6 @@ const RAMP_DEFAULT = [
 
 const DEFAULT_FIN = {
   targetMargin:35, qualityThreshold:90, infrastructureCost:0, otherOverhead:0,
-  payrollTz:"America/New_York",
   bonusTiers:[{name:"Bronze",minTasks:100,minQuality:90,bonusAmt:50},{name:"Silver",minTasks:150,minQuality:93,bonusAmt:150},{name:"Gold",minTasks:200,minQuality:96,bonusAmt:350}],
   regionRates:{US:30,EU:22,LATAM:12,APAC:10,Other:15},
 };
@@ -139,6 +501,26 @@ const TZ_OPTIONS = [
   { label:"PST · GMT-8",    iana:"America/Los_Angeles", abbr:"PST" },
   { label:"CET · GMT+2",    iana:"Europe/Berlin",       abbr:"CET" },
 ];
+const DEFAULT_TIME_TRACKER_TZ = "America/New_York";
+const isKnownTz = iana => TZ_OPTIONS.some(t => t.iana === iana);
+const timeTrackerTzKey = (userId, isAdmin) => `nes_tt_view_tz_${isAdmin ? "__admin__" : (userId || "unknown")}`;
+const readTimeTrackerTzPref = (userId, isAdmin) => {
+  try {
+    if (typeof window === "undefined") return DEFAULT_TIME_TRACKER_TZ;
+    const saved = window.localStorage.getItem(timeTrackerTzKey(userId, isAdmin));
+    return isKnownTz(saved) ? saved : DEFAULT_TIME_TRACKER_TZ;
+  } catch {
+    return DEFAULT_TIME_TRACKER_TZ;
+  }
+};
+const writeTimeTrackerTzPref = (userId, isAdmin, iana) => {
+  try {
+    if (typeof window === "undefined" || !isKnownTz(iana)) return;
+    window.localStorage.setItem(timeTrackerTzKey(userId, isAdmin), iana);
+  } catch {
+    // Ignore preference write failures (quota/private mode).
+  }
+};
 const QM_COLORS = [C.blue,C.purple,C.green,C.red,C.orange,C.cyan,C.teal,C.yellow,C.navy,"#ec4899"];
 
 const wallClockToUTC = (dateStr, timeStr, iana) => {
@@ -169,6 +551,8 @@ const fmtU = (n,d=2)=>`$${fmt(n,d)}`;
 const fmtP = (n,d=1)=>`${fmt(n,d)}%`;
 const today = ()=>new Date().toISOString().split("T")[0];
 const daysSince = d=>d?Math.floor((Date.now()-new Date(d).getTime())/86400000):null;
+const EMPTY_LIST = [];
+const EMPTY_OBJECT = {};
 // ─── TIME-TRACKER HELPERS ────────────────────────────────────────────────────
 const fmtTZ=(iso,iana)=>{try{return new Intl.DateTimeFormat("en-GB",{timeZone:iana,weekday:"short",day:"2-digit",month:"short"}).format(new Date(iso));}catch{return"—";}};
 const fmtTimeTZ=(iso,iana)=>{try{return new Intl.DateTimeFormat("en-GB",{timeZone:iana,hour:"2-digit",minute:"2-digit",hour12:false}).format(new Date(iso));}catch{return"—";}};
@@ -176,40 +560,16 @@ const isoDateInTZ=(iso,iana)=>{try{return new Intl.DateTimeFormat("en-CA",{timeZ
 const hasDayShift=(iso,tzA,tzB)=>tzA&&tzB&&tzA!==tzB?isoDateInTZ(iso,tzA)!==isoDateInTZ(iso,tzB):false;
 const fmtElapsed=s=>{const h=Math.floor(s/3600),m=Math.floor((s%3600)/60),sec=s%60;return[h,m,sec].map(n=>String(n).padStart(2,"0")).join(":");};
 const durStr=(s,e)=>{const ms=new Date(e)-new Date(s);if(ms<=0)return"—";const h=Math.floor(ms/3600000),m=Math.floor((ms%3600000)/60000);return h>0?`${h}h ${m}m`:`${m}m`;};
-const shiftIsoDay=(dayStr,delta)=>{
-  const [y,m,d]=String(dayStr).split("-").map(Number);
-  if(![y,m,d].every(Number.isFinite)) return dayStr;
-  const dt=new Date(Date.UTC(y,m-1,d));
-  dt.setUTCDate(dt.getUTCDate()+delta);
-  return dt.toISOString().slice(0,10);
+const weekBounds=(baseDate=new Date())=>{
+  const ws=new Date(baseDate);
+  const dow=ws.getDay();
+  ws.setDate(ws.getDate()-(dow===0?6:dow-1));
+  ws.setHours(0,0,0,0);
+  const we=new Date(ws);we.setDate(ws.getDate()+7);
+  return { weekStart:ws, weekEnd:we };
 };
-const weekdayIndexInTZ=(date,iana)=>{
-  try{
-    const wd=new Intl.DateTimeFormat("en-US",{timeZone:iana,weekday:"short"}).format(date);
-    const m={Sun:0,Mon:1,Tue:2,Wed:3,Thu:4,Fri:5,Sat:6};
-    return m[wd]??1;
-  }catch{return 1;}
-};
-const payrollWeekWindow=(baseDate=new Date(),iana="America/New_York")=>{
-  const baseDay=isoDateInTZ(baseDate.toISOString(),iana);
-  const dow=weekdayIndexInTZ(baseDate,iana);
-  const daysFromMonday=dow===0?6:dow-1;
-  const mondayDay=shiftIsoDay(baseDay,-daysFromMonday);
-  const nextMonday=shiftIsoDay(mondayDay,7);
-  const weekStartIso=wallClockToUTC(mondayDay,"00:00",iana);
-  const weekEndIso=wallClockToUTC(nextMonday,"00:00",iana);
-  return { weekStartIso, weekEndIso, mondayDay, nextMonday };
-};
-const clipMsToWindow=(startIso,endIso,winStartIso,winEndIso)=>{
-  const s=new Date(startIso).getTime();
-  const e=new Date(endIso).getTime();
-  const ws=new Date(winStartIso).getTime();
-  const we=new Date(winEndIso).getTime();
-  if(![s,e,ws,we].every(Number.isFinite)||e<=s||we<=ws) return 0;
-  return Math.max(0,Math.min(e,we)-Math.max(s,ws));
-};
-const opsMetricsById=(opsTeam,timeLogs,baseDate=new Date(),payrollTz="America/New_York")=>{
-  const { weekStartIso, weekEndIso }=payrollWeekWindow(baseDate,payrollTz);
+const opsMetricsById=(opsTeam,timeLogs,baseDate=new Date())=>{
+  const { weekStart, weekEnd }=weekBounds(baseDate);
   const byId={};
   opsTeam.forEach(o=>{byId[o.id]={approvedWeekHours:0,pendingWeekHours:0,approvedWeekPay:0,pendingWeekPay:0,totalApprovedPay:0,totalPendingPay:0};});
   const statusOf=l=>l.approvalStatus||"approved";
@@ -218,18 +578,16 @@ const opsMetricsById=(opsTeam,timeLogs,baseDate=new Date(),payrollTz="America/Ne
     const ms=new Date(l.endTime)-new Date(l.startTime);
     if(ms<=0) return;
     const hrs=ms/3600000;
-    const weekMs=clipMsToWindow(l.startTime,l.endTime,weekStartIso,weekEndIso);
-    const inWeek=weekMs>0;
-    const weekHrs=weekMs/3600000;
+    const inWeek=new Date(l.startTime)>=weekStart&&new Date(l.startTime)<weekEnd;
     const rate=l.hourlyRateSnapshot??(opsTeam.find(o=>o.id===l.qmId)?.hourlyRate||0);
     const pay=hrs*rate;
     const st=statusOf(l);
     if(st==="approved"){
       byId[l.qmId].totalApprovedPay+=pay;
-      if(inWeek){byId[l.qmId].approvedWeekHours+=weekHrs;byId[l.qmId].approvedWeekPay+=weekHrs*rate;}
+      if(inWeek){byId[l.qmId].approvedWeekHours+=hrs;byId[l.qmId].approvedWeekPay+=pay;}
     }else if(st==="pending"){
       byId[l.qmId].totalPendingPay+=pay;
-      if(inWeek){byId[l.qmId].pendingWeekHours+=weekHrs;byId[l.qmId].pendingWeekPay+=weekHrs*rate;}
+      if(inWeek){byId[l.qmId].pendingWeekHours+=hrs;byId[l.qmId].pendingWeekPay+=pay;}
     }
   });
   return byId;
@@ -357,11 +715,12 @@ function PersonTab({items,setItems,type,financials,timeLogs=[]}){
   const color=isE?C.blue:isR?C.purple:C.orange;
 
   const blank=()=>({
-    id:`${isE?"E":isR?"R":"O"}${String(items.length+1).padStart(3,"0")}`,
-    name:"",status:"active",region:"US",assignment:"",
+    id:"",
+    name:"",status:"active",region:"US",
     ...(isE||isR)?{
       tasksCompleted:0, lastWeekCompleted:0, qualityScore:0, avgSpeed:0,
-      perTaskRate:0, bonusEarned:0, joinDate:"", qualityHistory:[],
+      perTaskRate:0, bonusEarned:0, qualityHistory:[],
+      ...(isE?{dateAdded:today()}:{datePromoted:today()}),
     }:{},
     ...(!isE&&!isR)?{role:"",responsibilities:"",activityPct:0,hourlyRate:0}:{},
   });
@@ -376,11 +735,26 @@ function PersonTab({items,setItems,type,financials,timeLogs=[]}){
   );
 
   const openAdd=()=>{ setForm(blank()); setEditId(null); setModal(true); };
-  const openEdit=x=>{ setForm({...x,qualityHistory:x.qualityHistory||[]}); setEditId(x.id); setModal(true); };
+  const openEdit=x=>{
+    const dateFields=isE
+      ? { dateAdded:x.dateAdded||x.joinDate||"" }
+      : isR
+        ? { datePromoted:x.datePromoted||x.joinDate||"" }
+        : {};
+    setForm({...x,...dateFields,qualityHistory:x.qualityHistory||[]});
+    setEditId(x.id);
+    setModal(true);
+  };
   const save=()=>{
     if(!form.name.trim()) return;
     let finalForm={...form};
     const existing=items.find(x=>x.id===editId);
+    if(isE&&!finalForm.dateAdded){
+      finalForm={...finalForm,dateAdded:existing?.dateAdded||existing?.joinDate||today()};
+    }
+    if(isR&&!finalForm.datePromoted){
+      finalForm={...finalForm,datePromoted:existing?.datePromoted||existing?.joinDate||today()};
+    }
     if(editId&&existing&&(isE||isR)&&existing.qualityScore!==form.qualityScore&&form.qualityScore>0){
       finalForm={...finalForm,qualityHistory:[...(existing.qualityHistory||[]),{date:today(),score:form.qualityScore}].slice(-12)};
     }
@@ -388,7 +762,10 @@ function PersonTab({items,setItems,type,financials,timeLogs=[]}){
       finalForm={...finalForm,qualityHistory:[{date:today(),score:form.qualityScore}]};
     }
     if(editId) setItems(p=>p.map(x=>x.id===editId?finalForm:x));
-    else setItems(p=>[...p,finalForm]);
+    else setItems(p=>{
+      const nextId = uniqueIdForItems(p, isE ? "E" : isR ? "R" : "O");
+      return [...p, { ...finalForm, id: nextId }];
+    });
     setModal(false);
   };
   const del=id=>{ if(confirm("Delete?")) setItems(p=>p.filter(x=>x.id!==id)); };
@@ -396,7 +773,7 @@ function PersonTab({items,setItems,type,financials,timeLogs=[]}){
   const threshold=financials?.qualityThreshold||90;
   const withAHT=items.filter(x=>x.avgSpeed>0);
   const avgAHT=withAHT.length?withAHT.reduce((s,x)=>s+x.avgSpeed,0)/withAHT.length:0;
-  const opsMetrics=!isE&&!isR?opsMetricsById(items,timeLogs,new Date(),financials?.payrollTz||"America/New_York"):{};
+  const opsMetrics=!isE&&!isR?opsMetricsById(items,timeLogs,new Date()):{};
   const opsTotals=!isE&&!isR?items.reduce((acc,o)=>{
     const m=opsMetrics[o.id]||{};
     acc.approvedWeekHours+=(m.approvedWeekHours||0);
@@ -475,13 +852,13 @@ function PersonTab({items,setItems,type,financials,timeLogs=[]}){
                   const ws=wb.Sheets[wb.SheetNames[0]];
                   const rows=XLSX.utils.sheet_to_json(ws);
                   if(!rows.length){alert("No data found in file.");return;}
-                  const imported=rows.map((r,i)=>({
-                    id:`${isE?"E":"R"}${String(Date.now()+i).slice(-6)}`,
+                  const imported=rows.map(r=>({
+                    id:"",
                     name:r["Name"]||r["name"]||"",
                     status:(r["Status"]||r["status"]||"active").toLowerCase(),
                     region:r["Region"]||r["region"]||"US",
-                    assignment:r["Assignment"]||r["assignment"]||"",
-                    joinDate:r["Join Date"]||r["joinDate"]||"",
+                    dateAdded:isE?(r["Date Added"]||r["dateAdded"]||r["Join Date"]||r["joinDate"]||""):"",
+                    datePromoted:isR?(r["Date Promoted"]||r["datePromoted"]||r["Join Date"]||r["joinDate"]||""):"",
                     tasksCompleted:+(r["Current Total"]||r["tasksCompleted"]||0),
                     tasksReviewed:+(r["Current Total"]||r["tasksReviewed"]||0),
                     lastWeekCompleted:+(r["Last Week Total"]||r["lastWeekCompleted"]||0),
@@ -496,6 +873,7 @@ function PersonTab({items,setItems,type,financials,timeLogs=[]}){
                   setItems(prev=>{
                     const updated=[...prev];
                     const existingNames=new Map(prev.map(x=>[x.name.toLowerCase(),x]));
+                    const usedIds=new Set(prev.map(x=>String(x.id??"")).filter(Boolean));
                     const toAdd=[];
                     imported.forEach(imp=>{
                       const existing=existingNames.get(imp.name.toLowerCase());
@@ -503,7 +881,8 @@ function PersonTab({items,setItems,type,financials,timeLogs=[]}){
                         const idx=updated.findIndex(x=>x.id===existing.id);
                         if(idx>=0) updated[idx]={...existing,...imp,id:existing.id,qualityHistory:existing.qualityHistory||[]};
                       } else {
-                        toAdd.push(imp);
+                        const nextId=reserveUniqueId(usedIds,isE?"E":"R");
+                        toAdd.push({...imp,id:nextId});
                       }
                     });
                     return [...updated,...toAdd];
@@ -518,15 +897,13 @@ function PersonTab({items,setItems,type,financials,timeLogs=[]}){
         )}
         <ExBtn onClick={()=>{
           dlXLSX([{name:isE?"Experts":isR?"Reviewers":"Ops Team",data:items.map(x=>isE?({
-            ID:x.id,Name:x.name,Status:x.status,Region:x.region,Assignment:x.assignment,
+            ID:x.id,Name:x.name,Status:x.status,Region:x.region,"Date Added":x.dateAdded||x.joinDate||"",
             "Current Total":x.tasksCompleted,"Last Week Total":x.lastWeekCompleted||0,"Weekly Delta":x.tasksCompleted-(x.lastWeekCompleted||0),
-            "Quality %":x.qualityScore,"Avg AHT (h)":x.avgSpeed,"Per-Task $":x.perTaskRate,"Bonus $":x.bonusEarned,"Join Date":x.joinDate,
-            "Quality Trend":(x.qualityHistory||[]).map(h=>h.score).join("→")||"—",
+            "Quality %":x.qualityScore,"Avg AHT (h)":x.avgSpeed,"Per-Task $":x.perTaskRate,"Bonus $":x.bonusEarned,
           }):isR?({
-            ID:x.id,Name:x.name,Status:x.status,Region:x.region,Assignment:x.assignment,
+            ID:x.id,Name:x.name,Status:x.status,Region:x.region,"Date Promoted":x.datePromoted||x.joinDate||"",
             "Current Total":x.tasksReviewed,"Last Week Total":x.lastWeekCompleted||0,"Weekly Delta":x.tasksReviewed-(x.lastWeekCompleted||0),
             "Quality %":x.qualityScore,"Avg AHT (h)":x.avgSpeed,"Per-Task $":x.perTaskRate,"Bonus $":x.bonusEarned,
-            "Quality Trend":(x.qualityHistory||[]).map(h=>h.score).join("→")||"—",
           }):({
             ID:x.id,Name:x.name,Role:x.role,Status:x.status,Region:x.region,
             "Responsibilities":x.responsibilities||"",
@@ -542,15 +919,20 @@ function PersonTab({items,setItems,type,financials,timeLogs=[]}){
         <button onClick={openAdd} style={{...btnSm,background:color,color:"#fff",border:"none"}}>+ Add {isE?"Expert":isR?"Reviewer":"Ops Member"}</button>
       </div>
 
+      {(() => {
+        const tableCols=isE
+          ? ["#","Name","Status","Region","Date Added","This Week","Total","Quality","AHT","$/task"]
+          : isR
+            ? ["#","Name","Status","Region","Date Promoted","This Week","Total","Quality","AHT"]
+            : ["#","Name","Role","Region","Responsibilities","Approved Hrs/Wk","Pending Hrs/Wk","Rate ($/h)","Approved Pay/Wk","Pending Pay/Wk","Total Approved Pay","Activity","Status","Actions"];
+
+        return (
       <div style={{background:C.surface,border:`1px solid ${C.border}`,borderRadius:12,overflowX:"auto"}}>
         <table style={{width:"100%",borderCollapse:"collapse",minWidth:860}}>
-          <TH cols={isE?["#","Name","Status","Region","Assignment","This Week","Total","Quality","AHT","Trend","$/task","Actions"]
-            :isR?["#","Name","Status","Region","Assignment","This Week","Total","Quality","AHT","Trend","Actions"]
-            :["#","Name","Role","Region","Responsibilities","Approved Hrs/Wk","Pending Hrs/Wk","Rate ($/h)","Approved Pay/Wk","Pending Pay/Wk","Total Approved Pay","Activity","Status","Actions"]}/>
+          <TH cols={tableCols}/>
           <tbody>
-            {filtered.length===0&&<tr><td colSpan={14} style={{padding:40,textAlign:"center",color:C.faint}}>No {type}s yet. Click "+ Add" to get started.</td></tr>}
+            {filtered.length===0&&<tr><td colSpan={tableCols.length} style={{padding:40,textAlign:"center",color:C.faint}}>No {type}s yet. Click "+ Add" to get started.</td></tr>}
             {filtered.map((x,i)=>{
-              const hist=(x.qualityHistory||[]).map(h=>h.score);
               const delta=weeklyDelta(x);
               const ahtFlag=avgAHT>0&&x.avgSpeed>0?(x.avgSpeed>avgAHT*1.3?"slow":x.avgSpeed<avgAHT*0.6?"fast":null):null;
               const m=!isE&&!isR?(opsMetrics[x.id]||{}):null;
@@ -561,7 +943,9 @@ function PersonTab({items,setItems,type,financials,timeLogs=[]}){
                   {(!isE&&!isR)&&<td style={{padding:"10px 14px",color:C.blue,fontSize:13}}>{x.role}</td>}
                   {(isE||isR)&&<td style={{padding:"10px 14px"}}><Bdg color={STATUS_COLOR_MAP[x.status]||C.faint}>{x.status}</Bdg></td>}
                   <td style={{padding:"10px 14px",color:C.muted,fontSize:13}}>{x.region||"—"}</td>
-                  <td style={{padding:"10px 14px",color:C.muted,fontSize:13,maxWidth:130,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{x.assignment||x.responsibilities||"—"}</td>
+                  {isE&&<td style={{padding:"10px 14px",fontFamily:"'DM Mono',monospace",color:C.muted,fontSize:12}}>{x.dateAdded||x.joinDate||"—"}</td>}
+                  {isR&&<td style={{padding:"10px 14px",fontFamily:"'DM Mono',monospace",color:C.muted,fontSize:12}}>{x.datePromoted||x.joinDate||"—"}</td>}
+                  {(!isE&&!isR)&&<td style={{padding:"10px 14px",color:C.muted,fontSize:13,maxWidth:180,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{x.responsibilities||"—"}</td>}
                   {(isE||isR)&&<>
                     <td style={{padding:"10px 14px"}}>
                       <div style={{fontFamily:"'DM Mono',monospace",fontWeight:700,color:delta>0?C.green:delta<0?C.red:C.muted}}>
@@ -574,7 +958,6 @@ function PersonTab({items,setItems,type,financials,timeLogs=[]}){
                       <span style={{fontFamily:"'DM Mono',monospace",fontSize:12,color:ahtFlag==="slow"?C.red:ahtFlag==="fast"?C.yellow:C.muted}}>{x.avgSpeed>0?`${x.avgSpeed}h`:"—"}</span>
                       {ahtFlag&&<span style={{marginLeft:4}}><Bdg color={ahtFlag==="slow"?C.red:C.yellow}>{ahtFlag}</Bdg></span>}
                     </td>
-                    <td style={{padding:"10px 14px"}}><Spark data={hist} color={color} threshold={threshold}/></td>
                     {isE&&<td style={{padding:"10px 14px",fontFamily:"'DM Mono',monospace"}}>{x.perTaskRate>0?fmtU(x.perTaskRate):"—"}</td>}
                   </>}
                   {(!isE&&!isR)&&<>
@@ -590,18 +973,20 @@ function PersonTab({items,setItems,type,financials,timeLogs=[]}){
                     </td>
                     <td style={{padding:"10px 14px"}}><Bdg color={STATUS_COLOR_MAP[x.status]||C.faint}>{x.status}</Bdg></td>
                   </>}
-                  <td style={{padding:"10px 14px"}}>
+                  {(!isE&&!isR)&&<td style={{padding:"10px 14px"}}>
                     <div style={{display:"flex",gap:6}}>
                       <button onClick={()=>openEdit(x)} style={{...btnSm,padding:"3px 10px",fontSize:12}}>Edit</button>
                       <button onClick={()=>del(x.id)} style={{...btnSm,padding:"3px 10px",fontSize:12,color:C.red,borderColor:C.red+"50"}}>Del</button>
                     </div>
-                  </td>
+                  </td>}
                 </tr>
               );
             })}
           </tbody>
         </table>
       </div>
+        );
+      })()}
 
       {modal&&(
         <Modal title={`${editId?"Edit":"Add"} ${isE?"Expert":isR?"Reviewer":"Ops Member"}`} onClose={()=>setModal(false)}>
@@ -614,8 +999,8 @@ function PersonTab({items,setItems,type,financials,timeLogs=[]}){
             </FF>
             <FF label="Region"><select value={form.region} onChange={e=>upd("region",e.target.value)} style={selStyle}><option>US</option><option>LATAM</option><option>EU</option><option>APAC</option><option>Other</option></select></FF>
             {(isE||isR)&&<>
-              <FF label="Assignment"><input type="text" value={form.assignment} onChange={e=>upd("assignment",e.target.value)} style={iStyle}/></FF>
-              <FF label="Join Date"><input type="date" value={form.joinDate||""} onChange={e=>upd("joinDate",e.target.value)} style={iStyle}/></FF>
+              {isE&&<FF label="Date Added"><input type="date" value={form.dateAdded||""} onChange={e=>upd("dateAdded",e.target.value)} style={iStyle}/></FF>}
+              {isR&&<FF label="Date Promoted"><input type="date" value={form.datePromoted||""} onChange={e=>upd("datePromoted",e.target.value)} style={iStyle}/></FF>}
               <FF label={isE?"Current Total Completed":"Current Total Reviewed"}>
                 <input type="number" value={isE?form.tasksCompleted:form.tasksReviewed} onChange={e=>upd(isE?"tasksCompleted":"tasksReviewed",+e.target.value||0)} style={iStyle}/>
               </FF>
@@ -666,12 +1051,39 @@ function TicketsTab({tickets,setTickets,experts,reviewers,opsTeam}){
   const typeColor=t=>({expert:C.purple,ops:C.orange,review:C.cyan,documentation:C.blue,training:C.teal,miscellaneous:C.muted}[t]||C.muted);
   const create=()=>{
     if(!form.title.trim())return;
-    setTickets(p=>[...p,{...form,id:`TKT-${String(p.length+1).padStart(3,"0")}`,status:"NOT STARTED",createdAt:today()}]);
+    setTickets(p=>{
+      const nextId=uniqueIdForItems(p,"TKT");
+      return [...p,{...form,id:nextId,status:"NOT STARTED",createdAt:today()}];
+    });
     setForm({title:"",priority:"Medium",type:"expert",assignee:"",owner:"",deadline:"",description:""});setModal(false);
   };
-  const saveEdit=()=>{setTickets(p=>p.map(t=>t.id===editModal.id?{...t,...editModal}:t));setEditModal(null);};
-  const del=id=>setTickets(p=>p.filter(t=>t.id!==id));
-  const move=(id,status)=>setTickets(p=>p.map(t=>t.id===id?{...t,status}:t));
+  const saveEdit=()=>{
+    setTickets(p=>{
+      let edited=false;
+      return p.map(t=>{
+        if(edited||t.id!==editModal.id) return t;
+        edited=true;
+        return {...t,...editModal};
+      });
+    });
+    setEditModal(null);
+  };
+  const del=id=>setTickets(p=>{
+    let removed=false;
+    return p.filter(t=>{
+      if(removed||t.id!==id) return true;
+      removed=true;
+      return false;
+    });
+  });
+  const move=(id,status)=>setTickets(p=>{
+    let moved=false;
+    return p.map(t=>{
+      if(moved||t.id!==id) return t;
+      moved=true;
+      return {...t,status};
+    });
+  });
 
   return(
     <div style={{display:"flex",flexDirection:"column",gap:14}}>
@@ -778,11 +1190,12 @@ function TasksTab({taskTracker,setTaskTracker}){
   const newRevTasks=w.newReviewers*w.tasksPerWeekReviewer;
   const completedEOW=newAnnTasks;
   const reviewedEOW=Math.min(newRevTasks,completedEOW);
-  let cum=0;
-  const cumData=taskTracker.map(wk=>{
-    cum+=wk.newAnnotators*wk.tasksPerWeekAnnotator;
-    return{week:wk.label,completed:wk.newAnnotators*wk.tasksPerWeekAnnotator,cumulative:cum};
-  });
+  const cumData=taskTracker.reduce((acc,wk)=>{
+    const completed=wk.newAnnotators*wk.tasksPerWeekAnnotator;
+    const prevCum=acc.length>0?acc[acc.length-1].cumulative:0;
+    acc.push({week:wk.label,completed,cumulative:prevCum+completed});
+    return acc;
+  },[]);
   return(
     <div style={{display:"flex",flexDirection:"column",gap:20}}>
       <div style={{display:"flex",gap:8,flexWrap:"wrap",alignItems:"center"}}>
@@ -796,7 +1209,7 @@ function TasksTab({taskTracker,setTaskTracker}){
       <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:16}}>
         <div style={{background:"#fffbeb",border:"1px solid #fde68a",borderRadius:12,padding:20}}>
           <div style={{fontWeight:800,fontSize:14,marginBottom:14}}>📋 Tasks</div>
-          {[["Goal","goal",true],["SBQ Rate %",null,false],["Attempts Needed",null,false],["Actual",null,false],["Buffer",null,false]].map(([label,field])=>(
+          {[["Goal","goal",true],["SBQ Rate %",null,false],["Attempts Needed",null,false],["Actual",null,false],["Buffer",null,false]].map(([label])=>(
             <div key={label} style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"8px 0",borderBottom:"1px solid #fde68a50"}}>
               <span style={{color:C.muted,fontSize:13}}>{label}</span>
               {label==="Goal"?<InN value={w.goal} onChange={v=>upd("goal",v)} width="75px"/>
@@ -1060,7 +1473,7 @@ function StandupTab({experts,reviewers,opsTeam,tickets,taskTracker,financials}){
   const overdue=tickets.filter(t=>t.deadline&&new Date(t.deadline)<new Date()&&t.status!=="COMPLETED");
   const highPri=tickets.filter(t=>t.priority==="High"&&t.status!=="COMPLETED");
   const stale=tickets.filter(t=>t.createdAt&&daysSince(t.createdAt)>7&&t.status!=="COMPLETED");
-  const belowQ=all=>([...experts,...reviewers]).filter(x=>x.status==="active"&&x.qualityScore>0&&x.qualityScore<threshold);
+  const belowQ=()=> ([...experts,...reviewers]).filter(x=>x.status==="active"&&x.qualityScore>0&&x.qualityScore<threshold);
   const bq=belowQ();
   const zeroExperts=activeExperts.filter(e=>(e.tasksCompleted-(e.lastWeekCompleted||0))===0);
   const [copied,setCopied]=useState(false);
@@ -1280,7 +1693,7 @@ function FinancialsTab({experts,reviewers,opsTeam,timeLogs,financials,setFinanci
   const phase=PHASES.find(p=>p.id===activePhase);
   const regionRates=financials.regionRates||{US:30,EU:22,LATAM:12,APAC:10,Other:15};
   const updRegion=(r,v)=>setFinancials(p=>({...p,regionRates:{...(p.regionRates||{}),[r]:+v||0}}));
-  const opsMetrics=opsMetricsById(opsTeam,timeLogs||[],new Date(),financials?.payrollTz||"America/New_York");
+  const opsMetrics=opsMetricsById(opsTeam,timeLogs||[],new Date());
   const opsTotals=opsTeam.reduce((acc,o)=>{
     const m=opsMetrics[o.id]||{};
     acc.approvedWeekHours+=(m.approvedWeekHours||0);
@@ -1363,19 +1776,12 @@ function FinancialsTab({experts,reviewers,opsTeam,timeLogs,financials,setFinanci
       </Card>
       <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:20}}>
         <Card title="Global Settings">
-          <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"10px 0",borderBottom:`1px solid ${C.border}`}}>
-            <span style={{color:C.muted,fontSize:13}}>Payroll Timezone (official)</span>
-            <select value={financials.payrollTz||"America/New_York"} onChange={e=>setFinancials(p=>({...p,payrollTz:e.target.value}))} style={{...selStyle,width:180,fontSize:12,padding:"6px 10px"}}>
-              {TZ_OPTIONS.map(t=><option key={t.iana} value={t.iana}>{t.label}</option>)}
-            </select>
-          </div>
           {[["Infrastructure Cost ($)","infrastructureCost"],["Other Overhead ($)","otherOverhead"],["Target Margin %","targetMargin"],["Quality Threshold %","qualityThreshold"]].map(([label,field])=>(
             <div key={field} style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"10px 0",borderBottom:`1px solid ${C.border}`}}>
               <span style={{color:C.muted,fontSize:13}}>{label}</span>
               <InN value={financials[field]||0} onChange={v=>updF(field,v)} width="90px"/>
             </div>
           ))}
-          <div style={{marginTop:8,color:C.faint,fontSize:11}}>Weekly approved/pending hours and weekly pay are computed Monday–Sunday in this timezone.</div>
         </Card>
         <Card title="Regional Tiered Rates">
           <table style={{width:"100%",borderCollapse:"collapse"}}>
@@ -1455,7 +1861,7 @@ function FinancialsTab({experts,reviewers,opsTeam,timeLogs,financials,setFinanci
 }
 
 // ─── DASHBOARD ───────────────────────────────────────────────────────────────
-function DashboardTab({experts,reviewers,opsTeam,tickets,financials,taskTracker}){
+function DashboardTab({experts,reviewers,opsTeam,tickets,financials}){
   const threshold=financials.qualityThreshold||90;
   const weeklyAttempts=experts.reduce((s,e)=>s+(e.tasksCompleted-(e.lastWeekCompleted||0)),0);
   const weeklyReviews=reviewers.reduce((s,r)=>s+(r.tasksReviewed-(r.lastWeekCompleted||0)),0);
@@ -1522,7 +1928,7 @@ function DashboardTab({experts,reviewers,opsTeam,tickets,financials,taskTracker}
 }
 
 // ─── VISUALIZATIONS ──────────────────────────────────────────────────────────
-function VisualizationsTab({experts,reviewers,tickets,financials,taskTracker,opsTeam,timeLogs}){
+function VisualizationsTab({experts,reviewers,tickets,financials,taskTracker}){
   const ticketData=TICKET_STATUSES.map(s=>({name:s.split("/")[0],value:tickets.filter(t=>t.status===s).length,color:STATUS_COLORS[s]}));
   const qualityData=[...experts,...reviewers].filter(x=>x.qualityScore>0).map(x=>({name:x.name.split(" ")[0],quality:x.qualityScore,type:experts.includes(x)?"Expert":"Reviewer"}));
   const regionData=["US","EU","LATAM","APAC","Other"].map(r=>({region:r,experts:experts.filter(e=>e.region===r).length,reviewers:reviewers.filter(x=>x.region===r).length})).filter(x=>x.experts+x.reviewers>0);
@@ -1531,8 +1937,6 @@ function VisualizationsTab({experts,reviewers,tickets,financials,taskTracker,ops
   const statusCounts=PERSON_STATUSES.map(s=>({status:s,experts:experts.filter(e=>e.status===s).length,reviewers:reviewers.filter(r=>r.status===s).length})).filter(x=>x.experts+x.reviewers>0);
   const weeklyTrend=taskTracker.map(w=>({week:w.label,attempts:w.newAnnotators*w.tasksPerWeekAnnotator,reviews:w.newReviewers*w.tasksPerWeekReviewer}));
   const ahtData=[...experts,...reviewers].filter(x=>x.avgSpeed>0).map(x=>({name:x.name.split(" ")[0],aht:x.avgSpeed,quality:x.qualityScore,type:experts.includes(x)?"Expert":"Reviewer"}));
-  const opsMetrics=opsMetricsById(opsTeam,timeLogs||[],new Date(),financials?.payrollTz||"America/New_York");
-  const opsWeeklyPay=opsTeam.map(o=>({name:o.name.split(" ")[0],weeklyPay:(opsMetrics[o.id]?.approvedWeekPay||0),pendingPay:(opsMetrics[o.id]?.pendingWeekPay||0),totalPaid:(opsMetrics[o.id]?.totalApprovedPay||0)})).filter(x=>x.weeklyPay>0||x.pendingPay>0||x.totalPaid>0);
 
   const chart={background:C.surface,border:`1px solid ${C.border}`,borderRadius:12,padding:22};
   const ct={color:C.muted,fontSize:11,fontWeight:700,letterSpacing:"0.07em",textTransform:"uppercase",marginBottom:16};
@@ -1615,7 +2019,7 @@ function RiskTab({experts,reviewers,tickets,financials,opsTeam,timeLogs,taskTrac
   const rampSBQ=rampData[0]?rampData[0].sbqDefault:null;
   const sbqDrift=avgSBQ&&rampSBQ?((avgSBQ-rampSBQ)/rampSBQ*100):null;
   const totalRev=PHASES.reduce((s,p)=>s+(phaseFinancials[p.id]?.revenue||p.revenue),0);
-  const opsMetrics=opsMetricsById(opsTeam,timeLogs||[],new Date(),financials?.payrollTz||"America/New_York");
+  const opsMetrics=opsMetricsById(opsTeam,timeLogs||[],new Date());
   const opsApprovedTotal=opsTeam.reduce((s,o)=>s+(opsMetrics[o.id]?.totalApprovedPay||0),0);
   const totalCosts=experts.reduce((s,e)=>s+e.tasksCompleted*e.perTaskRate+e.bonusEarned,0)+reviewers.reduce((s,r)=>s+r.tasksReviewed*r.perTaskRate+r.bonusEarned,0)+opsApprovedTotal+(financials.infrastructureCost||0)+(financials.otherOverhead||0);
   const margin=totalRev>0?(totalRev-totalCosts)/totalRev*100:null;
@@ -1699,7 +2103,10 @@ function AccessTab({accessUsers,setAccessUsers}){
   const save=()=>{
     if(!form.name.trim()||!form.pin.trim())return;
     if(editUser){setAccessUsers(p=>p.map(u=>u.id===editUser.id?{...form,id:u.id,addedAt:u.addedAt}:u));setEditUser(null);}
-    else setAccessUsers(p=>[...p,{...form,id:Date.now().toString(),addedAt:today()}]);
+    else setAccessUsers(p=>{
+      const nextId=uniqueIdForItems(p,"USR");
+      return [...p,{...form,id:nextId,addedAt:today()}];
+    });
     setForm(blank());setModal(false);
   };
   const openEdit=u=>{setForm({name:u.name,email:u.email||"",role:u.role,pin:u.pin||"",tabs:u.tabs||{}});setEditUser(u);setModal(true);};
@@ -1772,11 +2179,10 @@ function AccessTab({accessUsers,setAccessUsers}){
 }
 
 // ─── TIME TRACKER ─────────────────────────────────────────────────────────────
-function TimeTrackerTab({timeLogs,setTimeLogs,qmSettings,setQmSettings,availEvents,setAvailEvents,opsTeam,accessUsers,currentUser,isAdmin,financials}){
-  const payrollTz=financials?.payrollTz||"America/New_York";
+function TimeTrackerTab({timeLogs,setTimeLogs,qmSettings,setQmSettings,setAvailEvents,opsTeam,accessUsers,currentUser,isAdmin}){
   const [subTab,setSubTab]=useState("log");
-  const [viewTz,setViewTz]=useState(payrollTz);
-  const [dailyWeekOffset,setDailyWeekOffset]=useState(0);
+  const [viewTz,setViewTz]=useState(()=>readTimeTrackerTzPref(currentUser?.id,isAdmin));
+  const [weekOffset,setWeekOffset]=useState(0);
   const [filterQm,setFilterQm]=useState("all");
   const [now,setNow]=useState(new Date());
   const [timer,setTimer]=useState({running:false,hasSession:false,sessionStartISO:null,adjustedStartISO:null,pausedElapsedMs:0,qmId:currentUser?.id||opsTeam[0]?.id||"",notes:"",activeLogId:null});
@@ -1790,13 +2196,14 @@ function TimeTrackerTab({timeLogs,setTimeLogs,qmSettings,setQmSettings,availEven
   const [rejectModal,setRejectModal]=useState(false);
   const [rejectLogId,setRejectLogId]=useState(null);
   const [rejectReason,setRejectReason]=useState("");
-  const TAB_ID = useRef(
-    sessionStorage.getItem("nesTabId") || (() => {
-      const id = Math.random().toString(36).slice(2);
-      sessionStorage.setItem("nesTabId", id);
-      return id;
-    })()
-  ).current;
+  const [TAB_ID] = useState(() => {
+    if (typeof window === "undefined") return "tab-ssr";
+    const existing = sessionStorage.getItem("nesTabId");
+    if (existing) return existing;
+    const id = (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") ? crypto.randomUUID() : makeId("tab");
+    sessionStorage.setItem("nesTabId", id);
+    return id;
+  });
 
   const isEditor=currentUser?.role==="editor";
   const myQmId=currentUser?.id||"";
@@ -1808,7 +2215,6 @@ function TimeTrackerTab({timeLogs,setTimeLogs,qmSettings,setQmSettings,availEven
   const isScopedQM=!isAdmin&&isEditor;
 
   const logsInScope=isAdmin?timeLogs:timeLogs.filter(l=>l.qmId===myQmId||l.qmId===resolvedQmId);
-  const eventsInScope=isAdmin?availEvents:availEvents.filter(e=>e.qmId===myQmId||e.qmId===resolvedQmId);
   const qmsInScope=isAdmin?opsTeam:(fallbackMyQm?[fallbackMyQm]:[]);
 
   const logStatus=l=>l.approvalStatus||"approved";
@@ -1845,32 +2251,38 @@ function TimeTrackerTab({timeLogs,setTimeLogs,qmSettings,setQmSettings,availEven
     const rate=l.hourlyRateSnapshot??(qm?.hourlyRate||0);
     return hoursForLog(l)*rate;
   };
-  const LOCK_TTL_MS=120000;
-  const isLockStale=log=>{
-    if(!log?.lastSeen) return true;
-    const age=Date.now()-new Date(log.lastSeen).getTime();
-    return !Number.isFinite(age)||age>LOCK_TTL_MS;
+  const canCurrentUserControlLog=log=>{
+    if(!log||isAdmin) return false;
+    return log.qmId===myQmId||log.qmId===resolvedQmId;
   };
-  const hydrateTimerFromLog=log=>setTimer({
-    running:true,
-    hasSession:true,
-    sessionStartISO:log.startTime,
-    adjustedStartISO:log.startTime,
-    pausedElapsedMs:0,
-    qmId:log.qmId,
-    notes:log.notes||"",
-    activeLogId:log.id,
-  });
-  const claimLockIfAllowed=log=>{
-    if(!log) return false;
-    if(!log.lockedBy||log.lockedBy===TAB_ID||isLockStale(log)){
+  const claimLockIfAllowed=(log,options={})=>{
+    const { allowTakeover=false, silent=false } = options;
+    if(!log){
+      if(!silent) alert("This timer session was not found.");
+      return false;
+    }
+    if(log.endTime){
+      if(!silent) alert("This timer has already been stopped in another tab.");
+      return false;
+    }
+    if(!log.lockedBy||log.lockedBy===TAB_ID){
       if(log.lockedBy!==TAB_ID){
         const stamp=new Date().toISOString();
         setTimeLogs(prev=>prev.map(l=>l.id===log.id?{...l,lockedBy:TAB_ID,lastSeen:stamp}:l));
       }
       return true;
     }
-    alert("This session is active in another tab. If that tab is closed, wait ~2 minutes and retry.");
+    if(canCurrentUserControlLog(log)){
+      if(!allowTakeover){
+        if(!silent) alert("This timer is active in another tab. Use Resume, Pause, or Stop here to explicitly take over control.");
+        return false;
+      }
+      if(!silent&&!confirm("This timer is active in another tab. Take over control in this tab?")) return false;
+      const stamp=new Date().toISOString();
+      setTimeLogs(prev=>prev.map(l=>l.id===log.id?{...l,lockedBy:TAB_ID,lastSeen:stamp}:l));
+      return true;
+    }
+    if(!silent) alert("This session is active in another tab.");
     return false;
   };
 
@@ -1880,12 +2292,38 @@ function TimeTrackerTab({timeLogs,setTimeLogs,qmSettings,setQmSettings,availEven
   // Restore any active (unfinished) session in current scope
   useEffect(()=>{
     if(isAdmin) return;
-    const active=logsInScope.find(l=>!l.endTime&&(l.qmId===myQmId||l.qmId===resolvedQmId));
-    if(active&&claimLockIfAllowed(active)) hydrateTimerFromLog(active);
-  },[myQmId,isAdmin,resolvedQmId]);// eslint-disable-line react-hooks/exhaustive-deps
+    const active=timeLogs.find(l=>!l.endTime&&(l.qmId===myQmId||l.qmId===resolvedQmId));
+    if(!active){
+      // eslint-disable-next-line react-hooks/set-state-in-effect
+      setTimer(prev=>{
+        if(!prev.hasSession&&!prev.activeLogId&&!prev.running) return prev;
+        return {running:false,hasSession:false,sessionStartISO:null,adjustedStartISO:null,pausedElapsedMs:0,qmId:resolvedQmId||prev.qmId,notes:"",activeLogId:null};
+      });
+      return;
+    }
+
+    const ownsLock=claimLockIfAllowed(active,{silent:true});
+    setTimer(prev=>{
+      const sameSession=prev.activeLogId===active.id;
+      const autoRunning=ownsLock||!active.lockedBy||active.lockedBy===TAB_ID;
+      const running=sameSession?(active.lockedBy&&active.lockedBy!==TAB_ID?false:prev.running):autoRunning;
+      const next={
+        running,
+        hasSession:true,
+        sessionStartISO:active.startTime,
+        adjustedStartISO:sameSession?(prev.adjustedStartISO||active.startTime):active.startTime,
+        pausedElapsedMs:sameSession?prev.pausedElapsedMs:0,
+        qmId:active.qmId,
+        notes:sameSession?prev.notes:(active.notes||""),
+        activeLogId:active.id,
+      };
+      return sameJSON(prev,next)?prev:next;
+    });
+  },[timeLogs,myQmId,isAdmin,resolvedQmId,TAB_ID]);// eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(()=>{
     if(!isAdmin&&resolvedQmId){
+      // eslint-disable-next-line react-hooks/set-state-in-effect
       setFilterQm(resolvedQmId);
       setTimer(t=>({...t,qmId:t.hasSession?t.qmId:resolvedQmId}));
       setManualForm(f=>({...f,qmId:resolvedQmId}));
@@ -1899,40 +2337,40 @@ function TimeTrackerTab({timeLogs,setTimeLogs,qmSettings,setQmSettings,availEven
   const getQmCfg=id=>qmSettings.find(s=>s.qmId===id)||{color:C.blue,homeTz:"UTC"};
   const tzAbbrFor=iana=>TZ_OPTIONS.find(t=>t.iana===iana)?.abbr||iana;
   const viewAbbr=tzAbbrFor(viewTz);
-  const payrollAbbr=tzAbbrFor(payrollTz);
+  const onViewTzChange=iana=>{
+    setViewTz(iana);
+    writeTimeTrackerTzPref(currentUser?.id,isAdmin,iana);
+  };
 
   // Elapsed derived from `now` — no separate setInterval needed
   const elapsedMs=timer.running&&timer.adjustedStartISO?Math.max(0,now.getTime()-new Date(timer.adjustedStartISO).getTime()):timer.pausedElapsedMs;
   const elapsedSec=Math.floor(elapsedMs/1000);
+  const activeTimerLog=timer.activeLogId?timeLogs.find(l=>l.id===timer.activeLogId):null;
+  const lockHeldElsewhere=!!activeTimerLog&&!activeTimerLog.endTime&&!!activeTimerLog.lockedBy&&activeTimerLog.lockedBy!==TAB_ID;
 
   const startTimer=()=>{
-    if(!timer.qmId) return;
-    const existingActive=timeLogs.find(l=>!l.endTime&&l.qmId===timer.qmId);
-    if(existingActive){
-      if(!claimLockIfAllowed(existingActive)) return;
-      hydrateTimerFromLog(existingActive);
-      return;
-    }
     const nowISO=new Date().toISOString();
     if(!timer.hasSession){
-      const newId="TL"+Date.now();
+      const newId=uniqueIdForItems(timeLogs,"TL");
       const rate=(getQm(timer.qmId)?.hourlyRate||0);
       setTimeLogs(prev=>[{id:newId,qmId:timer.qmId,startTime:nowISO,endTime:null,notes:timer.notes,source:"timer",approvalStatus:"pending",hourlyRateSnapshot:rate,lockedBy:TAB_ID,lastSeen:nowISO},...prev]);
       setTimer(t=>({...t,running:true,hasSession:true,sessionStartISO:nowISO,adjustedStartISO:nowISO,pausedElapsedMs:0,activeLogId:newId}));
     } else {
-      const resumed=new Date(Date.now()-timer.pausedElapsedMs).toISOString();
+      const activeLog=timeLogs.find(l=>l.id===timer.activeLogId);
+      if(!claimLockIfAllowed(activeLog,{allowTakeover:true})) return;
+      const resumed=timer.pausedElapsedMs>0?new Date(now.getTime()-timer.pausedElapsedMs).toISOString():(activeLog?.startTime||timer.sessionStartISO||nowISO);
       setTimer(t=>({...t,running:true,adjustedStartISO:resumed}));
     }
   };
   const pauseTimer=()=>{
     const activeLog=timeLogs.find(l=>l.id===timer.activeLogId);
-    if(!claimLockIfAllowed(activeLog)) return;
+    if(!claimLockIfAllowed(activeLog,{allowTakeover:true})) return;
     const elapsed=Math.max(0,now.getTime()-new Date(timer.adjustedStartISO).getTime());
     setTimer(t=>({...t,running:false,pausedElapsedMs:elapsed}));
   };
   const stopTimer=()=>{
     const activeLog=timeLogs.find(l=>l.id===timer.activeLogId);
-    if(!claimLockIfAllowed(activeLog)) return;
+    if(!claimLockIfAllowed(activeLog,{allowTakeover:true})) return;
     if(!timer.notes||!timer.notes.trim()){alert("Please add session notes describing what you worked on before stopping.");return;}
     const endTime=new Date().toISOString();
     setTimeLogs(prev=>prev.map(l=>l.id===timer.activeLogId?{...l,endTime,notes:timer.notes,approvalStatus:"pending",lockedBy:null,lastSeen:endTime,editHistory:pushHistory(l,"timer_stop","Timer session completed — pending admin approval")}:l));
@@ -1951,12 +2389,22 @@ function TimeTrackerTab({timeLogs,setTimeLogs,qmSettings,setQmSettings,availEven
     if(!timer.running||!timer.activeLogId) return;
     const touch=()=>{
       const stamp=new Date().toISOString();
-      setTimeLogs(prev=>prev.map(l=>l.id===timer.activeLogId?{...l,lastSeen:stamp,lockedBy:TAB_ID}:l));
+      setTimeLogs(prev=>{
+        let changed=false;
+        const next=prev.map(l=>{
+          if(l.id!==timer.activeLogId) return l;
+          if(l.endTime) return l;
+          if(l.lockedBy&&l.lockedBy!==TAB_ID) return l;
+          changed=true;
+          return {...l,lastSeen:stamp,lockedBy:TAB_ID};
+        });
+        return changed?next:prev;
+      });
     };
     touch();
     const t=setInterval(touch,30000);
     return()=>clearInterval(t);
-  },[timer.running,timer.activeLogId]);
+  },[timer.running,timer.activeLogId,setTimeLogs,TAB_ID]);
 
   const updateQmCfg=(qmId,patch)=>setQmSettings(prev=>{
     const exists=prev.find(s=>s.qmId===qmId);
@@ -1964,15 +2412,15 @@ function TimeTrackerTab({timeLogs,setTimeLogs,qmSettings,setQmSettings,availEven
     return[...prev,{qmId,color:C.blue,homeTz:"UTC",...patch}];
   });
 
-  // Payroll week boundaries (Mon–Sun) for official weekly totals
-  const { weekStartIso, weekEndIso, mondayDay }=payrollWeekWindow(now,payrollTz);
-  const selectedMondayDay=shiftIsoDay(mondayDay,dailyWeekOffset*7);
-  const selectedWeekDayKeys=Array.from({length:7},(_,i)=>shiftIsoDay(selectedMondayDay,i));
-  const fmtIsoDay=(isoDay,opts)=>{
-    const [y,m,d]=String(isoDay).split("-").map(Number);
-    if(![y,m,d].every(Number.isFinite)) return "—";
-    return new Date(Date.UTC(y,m-1,d)).toLocaleDateString("en-GB",{timeZone:"UTC",...opts});
-  };
+  // Week boundaries (Mon–Sun) for calendar + KPIs
+  const weekBase=new Date(now);
+  weekBase.setDate(weekBase.getDate() + (weekOffset*7));
+  const weekStart=new Date(weekBase);
+  const dow=weekStart.getDay();
+  weekStart.setDate(weekStart.getDate()-(dow===0?6:dow-1));
+  weekStart.setHours(0,0,0,0);
+  const weekEnd=new Date(weekStart);weekEnd.setDate(weekStart.getDate()+7);
+  const weekDays=Array.from({length:7},(_,i)=>{const d=new Date(weekStart);d.setDate(weekStart.getDate()+i);return d;});
 
   const msToDur=ms=>{const h=Math.floor(ms/3600000),m=Math.floor((ms%3600000)/60000);return h>0?`${h}h ${m}m`:`${m}m`;};
   const msClippedToDay = (log, dayDate, iana) => {
@@ -1999,28 +2447,16 @@ function TimeTrackerTab({timeLogs,setTimeLogs,qmSettings,setQmSettings,availEven
   };
   const approvedLogsInScope=logsInScope.filter(l=>l.endTime&&logStatus(l)==="approved");
   const pendingLogsInScope=logsInScope.filter(l=>l.endTime&&logStatus(l)==="pending");
-  const rejectedLogsInScope=logsInScope.filter(l=>l.endTime&&logStatus(l)==="rejected");
 
-  const weeklyPayForLog=(l)=>{
-    const qm=opsTeam.find(o=>o.id===l.qmId)||(l.qmId===myQmId?fallbackMyQm:null);
-    const rate=l.hourlyRateSnapshot??(qm?.hourlyRate||0);
-    const weekHours=clipMsToWindow(l.startTime,l.endTime,weekStartIso,weekEndIso)/3600000;
-    return weekHours*rate;
-  };
-
-  const myHours=approvedLogsInScope.reduce((s,l)=>s+clipMsToWindow(l.startTime,l.endTime,weekStartIso,weekEndIso),0);
-  const pendingHours=pendingLogsInScope.reduce((s,l)=>s+clipMsToWindow(l.startTime,l.endTime,weekStartIso,weekEndIso),0);
-  const myPayWeek=approvedLogsInScope.reduce((s,l)=>s+weeklyPayForLog(l),0);
-  const pendingPayWeek=pendingLogsInScope.reduce((s,l)=>s+weeklyPayForLog(l),0);
+  const myHours=approvedLogsInScope.filter(l=>new Date(l.startTime)>=weekStart&&new Date(l.startTime)<weekEnd).reduce((s,l)=>s+(new Date(l.endTime)-new Date(l.startTime)),0);
+  const pendingHours=pendingLogsInScope.filter(l=>new Date(l.startTime)>=weekStart&&new Date(l.startTime)<weekEnd).reduce((s,l)=>s+(new Date(l.endTime)-new Date(l.startTime)),0);
+  const myPayWeek=approvedLogsInScope.filter(l=>new Date(l.startTime)>=weekStart&&new Date(l.startTime)<weekEnd).reduce((s,l)=>s+payForLog(l),0);
+  const pendingPayWeek=pendingLogsInScope.filter(l=>new Date(l.startTime)>=weekStart&&new Date(l.startTime)<weekEnd).reduce((s,l)=>s+payForLog(l),0);
   const approvedPayTotal=approvedLogsInScope.reduce((s,l)=>s+payForLog(l),0);
   const pendingPayTotal=pendingLogsInScope.reduce((s,l)=>s+payForLog(l),0);
 
-  const activeSessions=logsInScope.filter(l=>!l.endTime).length;
-  const upcomingDeadlines=eventsInScope.filter(e=>e.type==="deadline"&&new Date(e.startTime)>now&&new Date(e.startTime)<new Date(now.getTime()+7*86400000)).length;
-
   const activeQMs=qmsInScope.filter(o=>o.status==="active");
   const filteredLogs=(isAdmin?(filterQm==="all"?logsInScope:logsInScope.filter(l=>l.qmId===filterQm)):logsInScope).slice().sort((a,b)=>new Date(b.startTime)-new Date(a.startTime));
-  const getEventsOnDay=d=>{const ds=isoDateInTZ(d.toISOString(),viewTz);return eventsInScope.filter(e=>isoDateInTZ(e.startTime,viewTz)===ds);};
 
   const openEditLog=(log)=>{
     setEditForm({id:log.id,qmId:log.qmId,startTime:toLocalInputValue(log.startTime),endTime:toLocalInputValue(log.endTime),notes:log.notes||""});
@@ -2096,7 +2532,7 @@ function TimeTrackerTab({timeLogs,setTimeLogs,qmSettings,setQmSettings,availEven
     if(new Date(endIso)<=new Date(startIso)) return;
     const isAdminSubmit=isAdmin;
     const status=isAdminSubmit?"approved":"pending";
-    const newId="TL"+Date.now();
+    const newId=uniqueIdForItems(timeLogs,"TL");
     const rate=(getQm(manualForm.qmId)?.hourlyRate||0);
     setTimeLogs(prev=>[{id:newId,qmId:manualForm.qmId,startTime:startIso,endTime:endIso,notes:manualForm.notes,source:"manual",approvalStatus:status,hourlyRateSnapshot:rate,requestedAt:new Date().toISOString(),requestedBy:currentUser?.id||"__admin__",editHistory:[{at:new Date().toISOString(),by:currentUser?.id||"__admin__",action:"create_manual",note:isAdminSubmit?"Manual log added by admin":"Manual log submitted for approval"}]},...prev]);
     setManualModal(false);
@@ -2127,7 +2563,7 @@ function TimeTrackerTab({timeLogs,setTimeLogs,qmSettings,setQmSettings,availEven
             <span style={{fontFamily:"'DM Mono',monospace",fontSize:12,color:"#94a3b8"}}>{fmtTimeTZ(now.toISOString(),viewTz)} {viewAbbr}</span>
             <div style={{display:"flex",alignItems:"center",gap:6}}>
               <span style={{color:"#64748b",fontSize:11,fontWeight:700,textTransform:"uppercase",letterSpacing:"0.05em"}}>View in</span>
-              <select value={viewTz} onChange={e=>setViewTz(e.target.value)} style={{background:"#0f172a",color:"#e2e8f0",border:"1px solid #334155",borderRadius:7,padding:"5px 10px",fontSize:12,cursor:"pointer",fontFamily:"inherit"}}>
+              <select value={viewTz} onChange={e=>onViewTzChange(e.target.value)} style={{background:"#0f172a",color:"#e2e8f0",border:"1px solid #334155",borderRadius:7,padding:"5px 10px",fontSize:12,cursor:"pointer",fontFamily:"inherit"}}>
                 {TZ_OPTIONS.map(t=><option key={t.iana} value={t.iana}>{t.label}</option>)}
               </select>
             </div>
@@ -2139,10 +2575,10 @@ function TimeTrackerTab({timeLogs,setTimeLogs,qmSettings,setQmSettings,availEven
       {subTab==="log"&&(
         <div style={{display:"flex",flexDirection:"column",gap:16}}>
           <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:14}}>
-            <KPI label="Approved Time This Week" value={myHours>0?msToDur(myHours):"0h"} color={C.blue} icon="⏱" sub={`official week (${payrollAbbr})`}/>
-            <KPI label="Approved Pay This Week" value={fmtU(myPayWeek)} color={C.green} icon="💵" sub={`official week (${payrollAbbr})`}/>
-            <KPI label="Pending Time This Week" value={pendingHours>0?msToDur(pendingHours):"0h"} color={C.yellow} icon="🕒" sub={`official week (${payrollAbbr})`}/>
-            <KPI label="Pending Pay This Week" value={fmtU(pendingPayWeek)} color={C.orange} icon="🧾" sub={isAdmin?`${pendingLogsInScope.length} pending request(s) · ${payrollAbbr}`:`awaiting admin approval · ${payrollAbbr}`}/>
+            <KPI label="Approved Time This Week" value={myHours>0?msToDur(myHours):"0h"} color={C.blue} icon="⏱"/>
+            <KPI label="Approved Pay This Week" value={fmtU(myPayWeek)} color={C.green} icon="💵"/>
+            <KPI label="Pending Time This Week" value={pendingHours>0?msToDur(pendingHours):"0h"} color={C.yellow} icon="🕒"/>
+            <KPI label="Pending Pay This Week" value={fmtU(pendingPayWeek)} color={C.orange} icon="🧾" sub={isAdmin?`${pendingLogsInScope.length} pending request(s)`:"awaiting admin approval"}/>
           </div>
 
           <Card title="Payments Summary">
@@ -2187,6 +2623,11 @@ function TimeTrackerTab({timeLogs,setTimeLogs,qmSettings,setQmSettings,availEven
             {timer.running&&timer.sessionStartISO&&(
               <div style={{marginTop:12,padding:"10px 14px",background:C.tealSoft,border:`1px solid ${C.teal}30`,borderRadius:8,color:C.teal,fontSize:13,lineHeight:1.5}}>
                 Started at <strong style={{fontFamily:"'DM Mono',monospace"}}>{fmtTimeTZ(timer.sessionStartISO,viewTz)} {viewAbbr}</strong> · Logging for <strong>{getQm(timer.qmId)?.name||"—"}</strong>
+              </div>
+            )}
+            {lockHeldElsewhere&&(
+              <div style={{marginTop:12,padding:"10px 14px",background:C.yellowSoft,border:`1px solid ${C.yellow}40`,borderRadius:8,color:C.yellowText,fontSize:13,lineHeight:1.5}}>
+                This timer is currently controlled in another tab. Use Resume, Pause, or Stop here and confirm takeover to force control in this tab.
               </div>
             )}
           </Card>
@@ -2364,48 +2805,43 @@ function TimeTrackerTab({timeLogs,setTimeLogs,qmSettings,setQmSettings,availEven
       {/* ── DAILY LOG ─────────────────────────────────────────────────────── */}
       {subTab==="daily"&&(
         <div style={{display:"flex",flexDirection:"column",gap:16}}>
-          <Card title={`Daily Hours (Official Payroll Week) · ${fmtIsoDay(selectedWeekDayKeys[0],{day:"numeric",month:"short"})} – ${fmtIsoDay(selectedWeekDayKeys[6],{day:"numeric",month:"short"})}`} extra={<div style={{display:"flex",gap:8,alignItems:"center",flexWrap:"wrap"}}>
-            <button onClick={()=>setDailyWeekOffset(v=>v-1)} style={{...btnSm,fontSize:12}}>← Previous Week</button>
-            <button onClick={()=>setDailyWeekOffset(0)} style={{...btnSm,fontSize:12,background:dailyWeekOffset===0?C.blue:C.surface,color:dailyWeekOffset===0?"#fff":C.text,border:dailyWeekOffset===0?"none":`1px solid ${C.border}`}}>This Week</button>
-            <button onClick={()=>setDailyWeekOffset(v=>v+1)} style={{...btnSm,fontSize:12}}>Next Week →</button>
+          <Card title={`Daily Hours · Week of ${weekDays[0].toLocaleDateString("en-GB",{day:"numeric",month:"short"})} – ${weekDays[6].toLocaleDateString("en-GB",{day:"numeric",month:"short"})}`} extra={<div style={{display:"flex",gap:8,alignItems:"center",flexWrap:"wrap"}}>
+            <button onClick={()=>setWeekOffset(w=>w-1)} style={{...btnSm,padding:"4px 10px",fontSize:12}}>◀ Prev Week</button>
+            <button onClick={()=>setWeekOffset(0)} disabled={weekOffset===0} style={{...btnSm,padding:"4px 10px",fontSize:12,opacity:weekOffset===0?0.5:1,cursor:weekOffset===0?"not-allowed":"pointer"}}>Current Week</button>
+            <button onClick={()=>setWeekOffset(w=>w+1)} style={{...btnSm,padding:"4px 10px",fontSize:12}}>Next Week ▶</button>
             {isAdmin&&<select value={filterQm} onChange={e=>setFilterQm(e.target.value)} style={{...selStyle,width:150,fontSize:12}}>
               <option value="all">All QMs</option>
               {opsTeam.map(o=><option key={o.id} value={o.id}>{o.name}</option>)}
             </select>}
             <ExBtn onClick={()=>{
               const scoped=(isAdmin&&filterQm!=="all")?logsInScope.filter(l=>l.qmId===filterQm):logsInScope;
-              const rows=selectedWeekDayKeys.map(ds=>{
-                const [y,m,d]=ds.split("-").map(Number);
-                const dayRef=new Date(Date.UTC(y,m-1,d));
-                const dayLogs=scoped.filter(l=>l.endTime&&msClippedToDay(l,dayRef,payrollTz)>0);
-                const approvedMs=dayLogs.filter(l=>logStatus(l)==="approved").reduce((s,l)=>s+msClippedToDay(l,dayRef,payrollTz),0);
-                const pendingMs=dayLogs.filter(l=>logStatus(l)==="pending").reduce((s,l)=>s+msClippedToDay(l,dayRef,payrollTz),0);
-                return {Day:fmtIsoDay(ds,{weekday:"short"}),Date:fmtIsoDay(ds,{day:"2-digit",month:"short"}),"Approved Hrs":+(approvedMs/3600000).toFixed(2),"Pending Hrs":+(pendingMs/3600000).toFixed(2),"Total Hrs":+((approvedMs+pendingMs)/3600000).toFixed(2),Entries:dayLogs.length};
+              const rows=weekDays.map(d=>{
+                const ds=isoDateInTZ(d.toISOString(),viewTz);
+                const dayLogs=scoped.filter(l=>l.endTime&&isoDateInTZ(l.startTime,viewTz)===ds);
+                const approvedMs=dayLogs.filter(l=>logStatus(l)==="approved").reduce((s,l)=>s+msClippedToDay(l,d,viewTz),0);
+                const pendingMs=dayLogs.filter(l=>logStatus(l)==="pending").reduce((s,l)=>s+msClippedToDay(l,d,viewTz),0);
+                return {Day:d.toLocaleDateString("en-GB",{weekday:"short"}),Date:d.toLocaleDateString("en-GB",{day:"2-digit",month:"short"}),"Approved Hrs":+(approvedMs/3600000).toFixed(2),"Pending Hrs":+(pendingMs/3600000).toFixed(2),"Total Hrs":+((approvedMs+pendingMs)/3600000).toFixed(2),Entries:dayLogs.length};
               });
               dlXLSX([{name:"Daily Hours",data:rows}],"NES_Daily_Time_Log");
             }} label="⬇ Export"/>
           </div>}>
-            <div style={{marginBottom:10,padding:"10px 12px",background:C.blueSoft,border:`1px solid ${C.blue}30`,borderRadius:8,color:C.blueText,fontSize:12,lineHeight:1.6}}>
-              <strong>Official basis:</strong> Daily totals here are calculated in <strong>{payrollAbbr}</strong> (payroll timezone) and are used for weekly pay. Changing display timezone elsewhere does not change these totals.
-            </div>
             <div style={{overflowX:"auto"}}>
               <table style={{width:"100%",borderCollapse:"collapse",minWidth:700}}>
                 <TH cols={["Day","Date","Approved Hours","Pending Hours","Total Hours","Entries"]}/>
                 <tbody>
-                  {selectedWeekDayKeys.map((ds,i)=>{
-                    const [y,m,d]=ds.split("-").map(Number);
-                    const dayRef=new Date(Date.UTC(y,m-1,d));
+                  {weekDays.map((day,i)=>{
+                    const ds=isoDateInTZ(day.toISOString(),viewTz);
                     const scoped=(isAdmin&&filterQm!=="all")?logsInScope.filter(l=>l.qmId===filterQm):logsInScope;
-                    const dayLogs=scoped.filter(l=>l.endTime&&msClippedToDay(l,dayRef,payrollTz)>0);
-                    const approvedMs=dayLogs.filter(l=>logStatus(l)==="approved").reduce((s,l)=>s+msClippedToDay(l,dayRef,payrollTz),0);
-                    const pendingMs=dayLogs.filter(l=>logStatus(l)==="pending").reduce((s,l)=>s+msClippedToDay(l,dayRef,payrollTz),0);
+                    const dayLogs=scoped.filter(l=>l.endTime&&isoDateInTZ(l.startTime,viewTz)===ds);
+                    const approvedMs=dayLogs.filter(l=>logStatus(l)==="approved").reduce((s,l)=>s+msClippedToDay(l,day,viewTz),0);
+                    const pendingMs=dayLogs.filter(l=>logStatus(l)==="pending").reduce((s,l)=>s+msClippedToDay(l,day,viewTz),0);
                     const totalMs=approvedMs+pendingMs;
-                    const isToday=isoDateInTZ(now.toISOString(),payrollTz)===ds;
-                    const hasCrossMidnight=dayLogs.some(l=>l.endTime&&isoDateInTZ(l.endTime,payrollTz)!==isoDateInTZ(l.startTime,payrollTz));
+                    const isToday=isoDateInTZ(now.toISOString(),viewTz)===ds;
+                    const hasCrossMidnight=dayLogs.some(l=>l.endTime&&isoDateInTZ(l.endTime,viewTz)!==isoDateInTZ(l.startTime,viewTz));
                     return(
                       <tr key={ds} style={{borderTop:`1px solid ${C.border}`,background:isToday?C.blueSoft:(i%2?"#fafafa":C.surface)}}>
-                        <td style={{padding:"10px 14px",fontWeight:700}}>{fmtIsoDay(ds,{weekday:"short"})}</td>
-                        <td style={{padding:"10px 14px",color:C.muted,fontSize:13}}>{fmtIsoDay(ds,{day:"2-digit",month:"short"})}</td>
+                        <td style={{padding:"10px 14px",fontWeight:700}}>{day.toLocaleDateString("en-GB",{weekday:"short"})}</td>
+                        <td style={{padding:"10px 14px",color:C.muted,fontSize:13}}>{day.toLocaleDateString("en-GB",{day:"2-digit",month:"short"})}</td>
                         <td style={{padding:"10px 14px",fontFamily:"'DM Mono',monospace",color:C.green}}>{(approvedMs/3600000).toFixed(2)}h</td>
                         <td style={{padding:"10px 14px",fontFamily:"'DM Mono',monospace",color:C.yellowText}}>{(pendingMs/3600000).toFixed(2)}h</td>
                         <td style={{padding:"10px 14px",fontFamily:"'DM Mono',monospace",fontWeight:700,color:C.text}}>{(totalMs/3600000).toFixed(2)}h</td>
@@ -2419,7 +2855,7 @@ function TimeTrackerTab({timeLogs,setTimeLogs,qmSettings,setQmSettings,availEven
                 </tbody>
               </table>
             </div>
-            <div style={{marginTop:10,fontSize:11,color:C.faint}}>Official totals are clipped to payroll day boundaries in {payrollAbbr}. Cross-midnight logs are split across days and flagged with ⚠.</div>
+            <div style={{marginTop:10,fontSize:11,color:C.faint}}>Hours are clipped to each calendar day boundary in {viewAbbr}. Cross-midnight logs are split across days and flagged with ⚠.</div>
           </Card>
         </div>
       )}
@@ -2489,7 +2925,10 @@ function TimeTrackerTab({timeLogs,setTimeLogs,qmSettings,setQmSettings,availEven
             if(!eventForm.startTime)return;
             const si=new Date(eventForm.startTime).toISOString();
             const ei=eventForm.type==="deadline"?si:(eventForm.endTime?new Date(eventForm.endTime).toISOString():si);
-            setAvailEvents(prev=>[...prev,{id:"AV"+Date.now(),qmId:eventForm.qmId||(isAdmin?"all":myQmId),type:eventForm.type,startTime:si,endTime:ei,label:eventForm.label}]);
+            setAvailEvents(prev=>{
+              const nextId=uniqueIdForItems(prev,"AV");
+              return [...prev,{id:nextId,qmId:eventForm.qmId||(isAdmin?"all":myQmId),type:eventForm.type,startTime:si,endTime:ei,label:eventForm.label}];
+            });
             setAddEventModal(false);
           }} style={btnPri}>Add Event</button>
         </Modal>
@@ -2548,27 +2987,38 @@ function TimeTrackerTab({timeLogs,setTimeLogs,qmSettings,setQmSettings,availEven
 export default function App(){
   const [userId,setUserId]=useState(null);
   const [activeTab,setActiveTab]=useState("Dashboard");
+  const idsRepairedRef=useRef(false);
 
-  const [experts,setExperts,l1]=useSupabase("experts",[]);
-  const [reviewers,setReviewers,l2]=useSupabase("reviewers",[]);
-  const [opsTeam,setOpsTeam,l3]=useSupabase("ops_team",[]);
-  const [tickets,setTickets,l4]=useSupabase("tickets",[]);
+  const [experts,setExperts,l1]=useSupabase("experts",EMPTY_LIST);
+  const [reviewers,setReviewers,l2]=useSupabase("reviewers",EMPTY_LIST);
+  const [opsTeam,setOpsTeam,l3]=useSupabase("ops_team",EMPTY_LIST);
+  const [tickets,setTickets,l4]=useSupabaseRows("tickets",EMPTY_LIST,"TKT");
   const [financials,setFinancials,l5]=useSupabase("financials",DEFAULT_FIN);
-  const [phaseFinancials,setPhaseFinancials,l6]=useSupabase("phase_financials",{});
-  const [taskTracker,setTaskTracker,l7]=useSupabase("task_tracker",[]);
+  const [phaseFinancials,setPhaseFinancials,l6]=useSupabase("phase_financials",EMPTY_OBJECT);
+  const [taskTracker,setTaskTracker,l7]=useSupabase("task_tracker",EMPTY_LIST);
   const [rampData,setRampData,l8]=useSupabase("ramp_data",RAMP_DEFAULT);
-  const [accessUsers,setAccessUsers,l9]=useSupabase("access_users",[]);
-  const [timeLogs,setTimeLogs,l10]=useSupabase("time_logs",[]);
-  const [qmSettings,setQmSettings,l11]=useSupabase("qm_settings",[]);
-  const [availEvents,setAvailEvents,l12]=useSupabase("availability_events",[]);
+  const [accessUsers,setAccessUsers,l9]=useSupabase("access_users",EMPTY_LIST);
+  const [timeLogs,setTimeLogs,l10]=useSupabaseRows("time_logs",EMPTY_LIST,"TL");
+  const [qmSettings,setQmSettings,l11]=useSupabase("qm_settings",EMPTY_LIST);
+  const [_availEvents,setAvailEvents,l12]=useSupabase("availability_events",EMPTY_LIST);
 
   const allLoaded=l1&&l2&&l3&&l4&&l5&&l6&&l7&&l8&&l9&&l10&&l11&&l12;
 
   const isAdmin=userId==="__admin__";
   const currentUser=accessUsers.find(u=>u.id===userId);
   const visibleTabs=isAdmin?ALL_TABS:currentUser?CONTROLLABLE_TABS.filter(t=>currentUser.tabs?.[t]):[];
+  const resolvedActiveTab=visibleTabs.includes(activeTab)?activeTab:(visibleTabs[0]||"Dashboard");
 
-  useEffect(()=>{ if(userId&&!visibleTabs.includes(activeTab)) setActiveTab(visibleTabs[0]||"Dashboard"); },[userId,visibleTabs.join(",")]);
+  useEffect(()=>{
+    if(!allLoaded||idsRepairedRef.current) return;
+    idsRepairedRef.current=true;
+
+    const ticketFix=normalizeIdCollection(tickets,"TKT");
+    if(ticketFix.changed) setTickets(ticketFix.items);
+
+    const timeLogFix=normalizeIdCollection(timeLogs,"TL");
+    if(timeLogFix.changed) setTimeLogs(timeLogFix.items);
+  },[allLoaded,tickets,timeLogs,setTickets,setTimeLogs]);
 
   const resetAll=()=>{ if(confirm("Reset ALL data? Cannot be undone.")){
     setExperts([]);setReviewers([]);setOpsTeam([]);setTickets([]);
@@ -2603,9 +3053,9 @@ export default function App(){
     "Quality Control":<QualityTab experts={experts} reviewers={reviewers} financials={financials}/>,
     "Ramp Plan":<RampPlanTab rampData={rampData} setRampData={setRampData}/>,
     Financials:<FinancialsTab experts={experts} reviewers={reviewers} opsTeam={opsTeam} timeLogs={timeLogs} financials={financials} setFinancials={setFinancials} phaseFinancials={phaseFinancials} setPhaseFinancials={setPhaseFinancials} taskTracker={taskTracker}/>,
-    Visualizations:<VisualizationsTab experts={experts} reviewers={reviewers} tickets={tickets} financials={financials} taskTracker={taskTracker} opsTeam={opsTeam} timeLogs={timeLogs}/>,
+    Visualizations:<VisualizationsTab experts={experts} reviewers={reviewers} tickets={tickets} financials={financials} taskTracker={taskTracker}/>,
     Risk:<RiskTab experts={experts} reviewers={reviewers} tickets={tickets} financials={financials} opsTeam={opsTeam} timeLogs={timeLogs} taskTracker={taskTracker} rampData={rampData} phaseFinancials={phaseFinancials}/>,
-    "Time Tracker":<TimeTrackerTab timeLogs={timeLogs} setTimeLogs={setTimeLogs} qmSettings={qmSettings} setQmSettings={setQmSettings} availEvents={availEvents} setAvailEvents={setAvailEvents} opsTeam={opsTeam} accessUsers={accessUsers} currentUser={currentUser} isAdmin={isAdmin} financials={financials}/>,
+    "Time Tracker":<TimeTrackerTab timeLogs={timeLogs} setTimeLogs={setTimeLogs} qmSettings={qmSettings} setQmSettings={setQmSettings} setAvailEvents={setAvailEvents} opsTeam={opsTeam} accessUsers={accessUsers} currentUser={currentUser} isAdmin={isAdmin}/>,
     Access:<AccessTab accessUsers={accessUsers} setAccessUsers={setAccessUsers}/>,
   };
 
@@ -2650,14 +3100,14 @@ export default function App(){
         </div>
         <div style={{padding:"0 16px",display:"flex",gap:0,overflowX:"auto",width:"100%",boxSizing:"border-box",WebkitOverflowScrolling:"touch"}}>
           {visibleTabs.map(tab=>(
-            <button key={tab} onClick={()=>setActiveTab(tab)} style={{background:"none",border:"none",color:activeTab===tab?"#60a5fa":"#94a3b8",padding:"9px 12px",cursor:"pointer",fontSize:12,fontWeight:activeTab===tab?700:500,borderBottom:activeTab===tab?"2px solid #60a5fa":"2px solid transparent",transition:"all 0.12s",whiteSpace:"nowrap",fontFamily:"inherit"}}>
+            <button key={tab} onClick={()=>setActiveTab(tab)} style={{background:"none",border:"none",color:resolvedActiveTab===tab?"#60a5fa":"#94a3b8",padding:"9px 12px",cursor:"pointer",fontSize:12,fontWeight:resolvedActiveTab===tab?700:500,borderBottom:resolvedActiveTab===tab?"2px solid #60a5fa":"2px solid transparent",transition:"all 0.12s",whiteSpace:"nowrap",fontFamily:"inherit"}}>
               {tab}
             </button>
           ))}
         </div>
       </div>
       <div className="tab-content" style={{padding:"20px 16px",width:"100%",boxSizing:"border-box"}}>
-        {tabContent[activeTab]||<div style={{color:C.muted,textAlign:"center",padding:60}}>Access denied.</div>}
+        {tabContent[resolvedActiveTab]||<div style={{color:C.muted,textAlign:"center",padding:60}}>Access denied.</div>}
       </div>
     </div>
   );
